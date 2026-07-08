@@ -887,7 +887,7 @@ class ComponentIn(BaseModel):
     active:             bool = True
 
 
-class ComponentUpdate(BaseModel):
+class ComponentMasterUpdate(BaseModel):
     component_name:     Optional[str] = None
     component_category: Optional[Literal[
         "Upper", "Sole", "Insole", "Sockliner", "Bottom",
@@ -2273,7 +2273,7 @@ async def create_component(payload: ComponentIn, request: Request):
 
 
 @api.put("/components/{cid}")
-async def update_component(cid: str, payload: ComponentUpdate, request: Request):
+async def update_component(cid: str, payload: ComponentMasterUpdate, request: Request):
     u = await get_current_user(request); require_roles("admin", "manager")(u)
     doc = await db.component_master.find_one({"_id": oid(cid)})
     if not doc:
