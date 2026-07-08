@@ -64,3 +64,25 @@
 ### Verified
 - User-provided Dropbox link resolved: image renders on the SSK_00001 card in Styles page. Underlying `dl.dropboxusercontent.com` URL returns a 322KB JPEG (verified via curl + magic-byte check `ff d8 ff …`).
 - Unit tests for all four rules pass (dropbox `/s/`, dropbox `/scl/fi/`, onedrive shortlink, onedrive full, gdrive `/file/d/`, gdrive `?id=`, already-normalized passthrough, plain URL passthrough, empty).
+
+## Iteration 25 (2026-07-08) — Demo data seeder for Online Orders / Picklists / Pending List
+### New: `python -m seed_demo` (in `/app/backend`)
+Idempotent standalone script that populates a realistic online-commerce dataset without touching production code paths. Every row carries `demo_tag="demo:online-seed"` so the seeder can also reset just its own rows via `--reset` without affecting real data.
+
+Seeds:
+- 11 `fg_location_inventory` rows (3 styles × Tan/Brown/Black/Beige × sizes 6-10 @ 10 pairs each) across the first 3 warehouse locations.
+- 6 `production_jobs` with `source_type="online_channel"` spread across `myntra`, `amazon`, `ajio` channels and stages `procurement` / `cutting` / `stitching` / `packing`. Total: 55 pairs pending.
+- 4 top-level `online_orders` with denormalized items into `online_order_items` (mirrors the runtime import-configured shape).
+- 3 `picklists` in different states (Pending × 2, In Progress × 1) with real rack/row/col from `warehouse_locations`.
+
+### Verified
+- `/api/online-orders` returns 6 online production jobs across 3 channels with correct stages.
+- `/api/production/pending-list` returns 6 pending jobs, each enriched with `image_display_url` + `style_name`, all "READY" (no BOM mapped → true by design; when BOMs exist the shortage banner will kick in).
+- `/api/picklists` returns 3 demo picklists; opening `PL-DEMO-0001` shows the product image thumb per row, location code, rack/row/col.
+
+### Usage
+```bash
+cd /app/backend
+python -m seed_demo             # seed (idempotent — safe to re-run)
+python -m seed_demo --reset     # wipe demo-tagged rows + reseed
+```
