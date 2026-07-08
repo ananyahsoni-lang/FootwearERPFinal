@@ -6,7 +6,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { useAuth } from "../lib/auth";
 import { Link } from "react-router-dom";
 
-const RACKS = ["A", "B", "C", "D"];
+const RACKS = ["A", "B", "C"];
 
 const STATUS_COLOR = {
   empty:   "#E2E8F0",   // slate-200
@@ -151,9 +151,10 @@ export default function WarehouseDashboard() {
         {/* Per-rack breakdown */}
         {dash && (
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            {RACKS.map(r => {
-              const rd = dash.by_rack[r];
-              const util = rd.capacity_pairs ? Math.round(rd.occupied_pairs / rd.capacity_pairs * 100) : 0;
+            {Object.keys(dash.by_rack || {}).sort().map(r => {
+              const rd = dash.by_rack[r] || {};
+              const cap = rd.capacity_pairs || 0;
+              const util = cap ? Math.round((rd.occupied_pairs || 0) / cap * 100) : 0;
               return (
                 <Card key={r} className={`p-4 cursor-pointer ${selectedRack === r ? "ring-2 ring-[#C27842]" : ""}`} onClick={() => setSelectedRack(r)}>
                   <div className="flex items-center justify-between">
@@ -248,7 +249,7 @@ export default function WarehouseDashboard() {
                       >
                         {isReturn && <RotateCcw className="w-2.5 h-2.5 absolute top-0.5 right-0.5 text-amber-700" />}
                         {cell.status === "blocked" && <Lock className="w-2.5 h-2.5 absolute top-0.5 left-0.5 text-red-800" />}
-                        <div className="font-bold">{cell.location_code.split("-").slice(1).join("-")}</div>
+                        <div className="font-bold">{cell.row ? `${String(cell.row).padStart(2,"0")}-${String(cell.column).padStart(2,"0")}` : cell.location_code}</div>
                         <div className="text-[9px]">{cell.occupied_pairs}/{cell.capacity_pairs}</div>
                       </button>
                     );

@@ -51,6 +51,12 @@ export default function BomEditorDrawer({ style, onClose, onSaved }) {
     if (!c) return "(missing)";
     return `${c.component_code} · ${c.component_name}${c.color ? ` (${c.color})` : ""}`;
   };
+  const componentStock = (cid) => {
+    const c = componentById(cid);
+    if (!c) return null;
+    const avail = Number(c.available_stock ?? (c.current_stock - (c.reserved_stock || 0)) ?? 0);
+    return { avail, total: Number(c.current_stock || 0), reserved: Number(c.reserved_stock || 0) };
+  };
 
   const rowValue = (row, key) => {
     if (dirtyById[row.id] && key in dirtyById[row.id]) return dirtyById[row.id][key];
@@ -174,6 +180,7 @@ export default function BomEditorDrawer({ style, onClose, onSaved }) {
                 <thead className="bg-slate-50 text-left">
                   <tr>
                     <th className="px-2 py-2 font-bold">Component</th>
+                    <th className="px-2 py-2 font-bold text-right w-28">In stock</th>
                     <th className="px-2 py-2 font-bold text-right w-24">Qty / pair</th>
                     <th className="px-2 py-2 font-bold text-right w-20">Waste %</th>
                     <th className="px-2 py-2 font-bold text-center w-16">Active</th>
@@ -183,6 +190,12 @@ export default function BomEditorDrawer({ style, onClose, onSaved }) {
                 <tbody>
                   {rows.map((row) => {
                     const dirty = !!dirtyById[row.id];
+                    const stock = componentStock(row.component_id);
+                    const stockClass =
+                      !stock ? "text-slate-400" :
+                      stock.avail <= 0 ? "text-red-700 bg-red-50" :
+                      stock.avail < 10 ? "text-amber-800 bg-amber-50" :
+                      "text-emerald-800";
                     return (
                       <tr
                         key={row.id}
@@ -191,6 +204,18 @@ export default function BomEditorDrawer({ style, onClose, onSaved }) {
                       >
                         <td className="px-2 py-1.5 font-mono">
                           {componentLabel(row.component_id)}
+                        </td>
+                        <td className={`px-2 py-1.5 text-right font-mono font-bold ${stockClass}`}>
+                          {stock ? (
+                            <>
+                              {stock.avail.toLocaleString()}
+                              {stock.reserved > 0 && (
+                                <span className="text-[10px] font-normal text-slate-500 ml-1" title={`${stock.total} total − ${stock.reserved} reserved`}>
+                                  ({stock.total}−{stock.reserved})
+                                </span>
+                              )}
+                            </>
+                          ) : "—"}
                         </td>
                         <td className="px-2 py-1.5 text-right">
                           <input
@@ -267,11 +292,15 @@ export default function BomEditorDrawer({ style, onClose, onSaved }) {
                   data-testid="bom-add-component-select"
                 >
                   <option value="">— pick a component —</option>
-                  {pickable.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.component_code} · {c.component_name}{c.color ? ` (${c.color})` : ""} · stock {c.current_stock}
-                    </option>
-                  ))}
+                  {pickable.map((c) => {
+                    const avail = Number(c.available_stock ?? (c.current_stock - (c.reserved_stock || 0)) ?? 0);
+                    const suffix = avail <= 0 ? " · OUT OF STOCK" : ` · ${avail} in stock`;
+                    return (
+                      <option key={c.id} value={c.id}>
+                        {c.component_code} · {c.component_name}{c.color ? ` (${c.color})` : ""}{suffix}
+                      </option>
+                    );
+                  })}
                 </select>
                 {pickable.length === 0 && (
                   <div className="text-[10px] text-slate-500 mt-1">All components are already mapped to this style.</div>

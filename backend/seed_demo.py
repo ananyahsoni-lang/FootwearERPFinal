@@ -308,11 +308,11 @@ async def seed_components_and_boms(db, styles):
         (s2, "DEMO-UPP-BEG"),
     ]
     common = [
+        # Only the two essentials that scale per pair. Packaging (Box / Poly /
+        # Tag) is intentionally NOT auto-seeded so the operator can add just
+        # what their style actually consumes via the BOM editor.
         ("DEMO-SOL-EVA",  1.0, 3.0),
         ("DEMO-INS-MEM",  1.0, 2.0),
-        ("DEMO-BOX-STD",  1.0, 1.0),
-        ("DEMO-BAG-POLY", 1.0, 0.5),
-        ("DEMO-TAG-BRAND", 2.0, 0.5),
     ]
     inserted, skipped = 0, 0
     for style, upper_code in bom_plan:

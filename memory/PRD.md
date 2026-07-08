@@ -151,3 +151,24 @@ python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 - Style-variants endpoint returned `["Brown","Tan"] × ["7","8","9"]` for SSK_00001 — matches seeded inventory.
 - Matrix flow: filled Tan/7=5, Tan/8=3, Brown/9=2 → clicked "Produce 10 pairs" → 2 cells produced (7 pairs placed at `01-A-01`, deductions across 8 components), 1 cell surfaced a shortfall-reason error. Grand total pill correctly showed 10 in the header button.
 - Seeder final counts: 8 components, 18 BOM rows, 3 demo styles with production cards ready.
+
+## Iteration 29 (2026-07-08) — Warehouse dashboard fix + BOM stock display + Leaner seed
+### Bug — Warehouse Dashboard crash
+- Symptom: `TypeError: Cannot read properties of undefined (reading 'capacity_pairs')` in `WarehouseDashboard`.
+- Root cause: frontend `RACKS` constant was still `["A","B","C","D"]` from the old layout; the rebuilt DB only has `["A","B","C"]`, so `dash.by_rack["D"]` → undefined → crash on `.capacity_pairs`.
+- Fixes:
+  - `RACKS = ["A","B","C"]` on the dashboard (kept in sync with backend).
+  - Rack tiles now derive from `Object.keys(dash.by_rack).sort()` — future-proof if the layout changes again.
+  - Cell label now shows `row-col` (e.g. `01-01`) instead of the old `.split("-").slice(1)` slice that mis-labeled cells under the new `{line}-{rack}-{cell}` scheme.
+- Verified: dashboard renders 240 cells / 9,600 pairs, Rack A/B/C tiles with utilization, `01-01`…`10-08` cell labels.
+
+### Enhancement — BOM editor shows live component stock
+- New "In stock" column on the BOM table:
+  - Green when `available ≥ 10`, amber `< 10`, red when `≤ 0`.
+  - Shows reserved breakdown `(total−reserved)` on hover / inline when non-zero reserved.
+- Add-component dropdown now suffixes each option with `· N in stock` or `· OUT OF STOCK`.
+
+### Enhancement — Leaner seeded BOMs
+- Cut the common-component list from Sole + Insole + Box + PolyBag + BrandTag → **just Sole + Insole**.
+- Every demo style now has a lean 3-row BOM (`Upper + Sole + Insole`) that the operator can extend via the drawer's "Add component" row. Prior test data (16 BOM rows across 3 styles) cleaned up; reseeded to 9 total.
+- Rationale: packaging is style-agnostic and better tracked separately; auto-adding it to every style clutters the BOM editor and creates false coupling.
