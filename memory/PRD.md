@@ -172,3 +172,32 @@ python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 - Cut the common-component list from Sole + Insole + Box + PolyBag + BrandTag → **just Sole + Insole**.
 - Every demo style now has a lean 3-row BOM (`Upper + Sole + Insole`) that the operator can extend via the drawer's "Add component" row. Prior test data (16 BOM rows across 3 styles) cleaned up; reseeded to 9 total.
 - Rationale: packaging is style-agnostic and better tracked separately; auto-adding it to every style clutters the BOM editor and creates false coupling.
+
+## Iteration 30 (2026-07-08) — Online production merged into Ready Stock + Shortage confirm + Live feasibility
+### Removed the standalone Online Production Floor page
+- Deleted `/app/frontend/src/pages/OnlineProductionFloor.jsx` + its route + its sidebar entry.
+- Extracted the reusable `AdHocProduceDrawer` into `/app/frontend/src/components/AdHocProduceDrawer.jsx`.
+- Wired the drawer into **Ready Stock** — new header button **"Produce & Add"** opens a style picker → then the same color × size matrix drawer. Excess pairs still land in the style's home cell via `/production/produce-cell`. This puts component-withdrawal + stock addition on the SAME screen operators already use for FG inventory.
+
+### Isolated online production from the B2B Kanban
+- `GET /api/production/jobs` now defaults to `source_type=b2b_client`. Online jobs (which don't produce an invoice) no longer clutter the B2B Kanban. Pass `?source_type=all` or `?source_type=online_channel` to override.
+- Verified: default list returns 0 online jobs today; `?source_type=all` returns all 17.
+
+### Component shortage guard on produce-cell
+- `POST /api/production/produce-cell` now runs a **pre-flight feasibility check** before any deduction. If any component would go below zero, returns **HTTP 409** with `code: component_shortage` and a per-component breakdown (needed / available / shortfall). Response body carries the shortages so the client can render a proper confirm.
+- New param `force_negative_stock: true` opts the operator into proceeding — deducts anyway and marks stock negative. The `component_master.history` push already records the negative row for the ledger.
+- Both `AdHocProduceDrawer` (Ready Stock) and `ProduceCellDrawer` (Pending List) surface a **red "proceed anyway?"** confirmation with per-component numbers before re-submitting with `force_negative_stock=true`.
+
+### Live feasibility indicator on the drawer
+- New `GET /api/production/bom-feasibility/{style_id}?pairs=N` — pre-computes per-component `needed` vs `available` for the current BOM without touching any stock.
+- The ad-hoc drawer polls this endpoint (with request cancellation) whenever the grand total changes, and renders a colour-coded banner next to the "Deduct from Component Inventory" toggle:
+  - Green "BOM feasible for N pairs" when every component has enough.
+  - Red "Shortage: X (need N, have M, short K)" when at least one would go negative.
+  - Amber "No production card mapped" when the style has no BOM (with a shortcut to the editor).
+
+### Verified end-to-end
+- Sidebar under Online Commerce no longer shows the "Production Floor" entry.
+- Ready Stock header now has the new `PRODUCE & ADD` button; clicking it opens the style picker and then the matrix drawer.
+- Feasibility banner appears instantly when 400 pairs of Brown/Sz7 is entered for SSK_00001: `Shortage: DEMO-UPP-TAN (need 420, have 120, short 300) …`
+- Confirming through the 409 → `force_negative_stock=true` path drives stock negative and returns the expected `new_stock` values.
+- B2B Production Kanban's default `/production/jobs` call returns only B2B jobs (verified via curl).

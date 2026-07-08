@@ -1,210 +1,8 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 import { http, friendlyAxiosError } from "../lib/api";
-import { PageHeader, Card, BtnPrimary, BtnSecondary, Badge } from "../components/ui-kit";
-import { SafeImage } from "../components/ImageUploader";
-import BomEditorDrawer from "../components/BomEditorDrawer";
-import { RefreshCw, Wrench, Hammer, Package, Loader2, X, Info } from "lucide-react";
-
-/**
- * OnlineProductionFloor
- *
- * A dedicated production floor for Online Commerce. Unlike B2B where a PO
- * drives production, online production is triggered on-demand:
- *   1. Operator picks a style from the pipeline.
- *   2. Sets a color + size + quantity.
- *   3. Optionally deducts components (BOM must exist; can be created / edited
- *      right on this page via the same BomEditorDrawer).
- *   4. Produced pairs land directly in FG stock in the style's home cell
- *      (via /production/produce-cell — pending list gets consumed first if any,
- *       any excess goes straight to stock).
- *
- * Reuses the B2B production infrastructure (production_jobs + fg_stock +
- * component_master) — this page is just a focused entry point for online.
- */
-export default function OnlineProductionFloor() {
-  const [pipelineStyles, setPipelineStyles] = useState([]);
-  const [bomCounts, setBomCounts]           = useState({}); // style_id → active BOM row count
-  const [loading, setLoading]               = useState(true);
-  const [err, setErr]                       = useState("");
-
-  const [bomStyle, setBomStyle]     = useState(null);   // opens BomEditorDrawer
-  const [produceStyle, setProduceStyle] = useState(null); // opens AdHocProduceDrawer
-
-  const load = useCallback(async () => {
-    setLoading(true); setErr("");
-    try {
-      // Same source as OnlineStylePipeline board — returns styles opted-in for online.
-      // Response already carries style_code/style_name/image_url so we don't need
-      // a separate /styles enrichment round-trip.
-      const r = await http.get("/styles/online");
-      const cards = r.data || [];
-      const merged = cards
-        .map((c) => ({
-          id:                   c.style_id,
-          code:                 c.style_code || "—",
-          name:                 c.style_name || "",
-          image_url:            c.image_url,
-          image_display_url:    c.image_display_url,
-          image_thumbnail_url:  c.image_thumbnail_url,
-          online_status:        c.online_status,
-        }))
-        .filter((s) => !!s.id);
-      setPipelineStyles(merged);
-
-      // Cheap parallel BOM count lookup so cards can show "3 components mapped"
-      // (this scales fine for a curated pipeline — usually <100 styles).
-      const counts = {};
-      await Promise.all(merged.map(async (s) => {
-        try {
-          const b = await http.get(`/style-component-mapping?style_id=${s.id}`);
-          counts[s.id] = (b.data || []).filter((r) => r.active !== false).length;
-        } catch {
-          counts[s.id] = 0;
-        }
-      }));
-      setBomCounts(counts);
-    } catch (e) {
-      setErr(friendlyAxiosError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const summary = useMemo(() => ({
-    total_styles:       pipelineStyles.length,
-    styles_with_bom:    pipelineStyles.filter((s) => (bomCounts[s.id] || 0) > 0).length,
-    styles_without_bom: pipelineStyles.filter((s) => !(bomCounts[s.id] || 0)).length,
-  }), [pipelineStyles, bomCounts]);
-
-  return (
-    <div data-testid="page-online-production-floor">
-      <PageHeader
-        title="Online Production Floor"
-        subtitle="Produce on demand · no PO required · shares components + racks with the B2B floor"
-        testId="op-floor-header"
-        action={
-          <BtnSecondary onClick={load} disabled={loading} data-testid="op-refresh">
-            <RefreshCw className={`w-3.5 h-3.5 inline mr-1 ${loading ? "animate-spin" : ""}`} />Refresh
-          </BtnSecondary>
-        }
-      />
-
-      <div className="p-4 sm:p-6 space-y-4">
-        {err && <div className="p-3 bg-red-50 border-2 border-red-300 text-red-800 text-sm">{err}</div>}
-
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <Card className="p-4">
-            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Pipeline styles</div>
-            <div className="text-3xl font-black mt-1">{summary.total_styles}</div>
-            <div className="text-xs text-slate-500">available to produce</div>
-          </Card>
-          <Card className="p-4 border-emerald-300">
-            <div className="text-[10px] uppercase tracking-wider font-bold text-emerald-700">Ready (BOM mapped)</div>
-            <div className="text-3xl font-black mt-1 text-emerald-800">{summary.styles_with_bom}</div>
-            <div className="text-xs text-slate-500">deducts components automatically</div>
-          </Card>
-          <Card className="p-4 border-amber-300">
-            <div className="text-[10px] uppercase tracking-wider font-bold text-amber-700">Need production card</div>
-            <div className="text-3xl font-black mt-1 text-amber-800">{summary.styles_without_bom}</div>
-            <div className="text-xs text-slate-500">map components first</div>
-          </Card>
-          <Card className="p-4">
-            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Floor mode</div>
-            <div className="text-lg font-black mt-1">Ad-hoc / On-demand</div>
-            <div className="text-xs text-slate-500">no PO gate</div>
-          </Card>
-        </div>
-
-        <div className="p-3 bg-slate-50 border-2 border-slate-200 text-xs text-slate-700 flex items-start gap-2">
-          <Info className="w-4 h-4 flex-shrink-0 mt-0.5 text-slate-500" />
-          <div>
-            Only styles you&apos;ve <strong>opted into the Online Pipeline</strong> appear here. Add or remove them from
-            the <em>Styles</em> master (globe icon on a style card) or the <em>Online Style Pipeline</em> board.
-          </div>
-        </div>
-
-        {loading ? (
-          <Card className="p-10 text-center text-slate-400">Loading…</Card>
-        ) : pipelineStyles.length === 0 ? (
-          <Card className="p-10 text-center text-slate-500">
-            No styles in the online pipeline yet. Opt-in a style from the <em>Styles</em> master to see it here.
-          </Card>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {pipelineStyles.map((s) => {
-              const cnt = bomCounts[s.id] || 0;
-              return (
-                <Card key={s.id} className="p-0 overflow-hidden">
-                  <div className="flex items-stretch">
-                    <div className="w-24 flex-shrink-0 bg-slate-50 border-r border-slate-200">
-                      <SafeImage
-                        image={{
-                          url: s.image_url,
-                          display_url: s.image_display_url,
-                          thumbnail_url: s.image_thumbnail_url,
-                        }}
-                        alt={s.code}
-                        aspectRatio="1/1"
-                        className="w-full h-full"
-                      />
-                    </div>
-                    <div className="flex-1 p-3 min-w-0">
-                      <div className="font-mono font-black text-sm truncate" data-testid={`op-style-${s.code}`}>{s.code}</div>
-                      <div className="text-xs text-slate-500 truncate">{s.name}</div>
-                      <div className="mt-1 flex gap-1 flex-wrap">
-                        <Badge color={s.online_status === "live" ? "green" : "gray"}>{s.online_status || "draft"}</Badge>
-                        {cnt > 0
-                          ? <Badge color="emerald">{cnt} components</Badge>
-                          : <Badge color="amber">No BOM</Badge>}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="border-t border-slate-200 flex divide-x divide-slate-200">
-                    <button
-                      onClick={() => setBomStyle(s)}
-                      className="flex-1 py-2 text-xs font-bold uppercase tracking-wider hover:bg-slate-50"
-                      data-testid={`op-edit-bom-${s.code}`}
-                    >
-                      <Wrench className="w-3.5 h-3.5 inline mr-1" />
-                      {cnt > 0 ? "Edit Production Card" : "Create Production Card"}
-                    </button>
-                    <button
-                      onClick={() => setProduceStyle(s)}
-                      className="flex-1 py-2 text-xs font-bold uppercase tracking-wider bg-slate-900 text-white hover:bg-slate-800"
-                      data-testid={`op-produce-${s.code}`}
-                    >
-                      <Hammer className="w-3.5 h-3.5 inline mr-1" />Produce
-                    </button>
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {bomStyle && (
-        <BomEditorDrawer
-          style={bomStyle}
-          onClose={() => { setBomStyle(null); load(); }}
-          onSaved={() => load()}
-        />
-      )}
-      {produceStyle && (
-        <AdHocProduceDrawer
-          style={produceStyle}
-          hasBom={(bomCounts[produceStyle.id] || 0) > 0}
-          onClose={() => setProduceStyle(null)}
-          onEditBom={() => { setBomStyle(produceStyle); setProduceStyle(null); }}
-          onDone={() => { setProduceStyle(null); load(); }}
-        />
-      )}
-    </div>
-  );
-}
-
+import { BtnPrimary, BtnSecondary } from "./ui-kit";
+import { SafeImage } from "./ImageUploader";
+import { X, Loader2, Wrench, Package, AlertTriangle, CheckCircle2 } from "lucide-react";
 
 /* ────────────────────────────────────────────────────────────
    AdHocProduceDrawer — color × size matrix. Operators can produce
@@ -213,7 +11,7 @@ export default function OnlineProductionFloor() {
    cell → one POST /production/produce-cell call. Result summary
    surfaces per-cell success/error.
    ──────────────────────────────────────────────────────────────── */
-function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
+export default function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
   const [colors, setColors]     = useState([]);
   const [sizes, setSizes]       = useState([]);
   const [qty, setQty]           = useState({});         // key `${c}||${s}` → number
@@ -222,7 +20,9 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
   const [useComponents, setUseComp] = useState(hasBom);
   const [busy, setBusy]         = useState(false);
   const [err, setErr]           = useState("");
-  const [results, setResults]   = useState(null);  // {ok:[], errors:[]}
+  const [results, setResults]   = useState(null);
+  const [feasibility, setFeasibility] = useState(null); // {feasible, components, missing_bom, pairs}
+  const [shortageConfirm, setShortageConfirm] = useState(null); // { shortages, onConfirm }
 
   // Prefill the matrix from any variants this style has been produced/stored in.
   useEffect(() => {
@@ -245,6 +45,23 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
   const rowTotal = (c) => sizes.reduce((sum, s) => sum + cellVal(c, s), 0);
   const colTotal = (s) => colors.reduce((sum, c) => sum + cellVal(c, s), 0);
   const grandTotal = colors.reduce((sum, c) => sum + rowTotal(c), 0);
+
+  // Live BOM feasibility preview — recomputes whenever grand total changes.
+  useEffect(() => {
+    if (!useComponents || grandTotal <= 0) { setFeasibility(null); return; }
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const r = await http.get(`/production/bom-feasibility/${style.id}?pairs=${grandTotal}`, {
+          signal: controller.signal,
+        });
+        setFeasibility(r.data);
+      } catch (e) {
+        if (e.name !== "CanceledError") setFeasibility(null);
+      }
+    })();
+    return () => controller.abort();
+  }, [style.id, useComponents, grandTotal]);
 
   const addColor = () => {
     const v = newColor.trim();
@@ -275,7 +92,7 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
     });
   };
 
-  const submit = async () => {
+  const runProduction = async (force) => {
     setErr(""); setResults(null); setBusy(true);
     // Build the list of non-zero cells
     const cells = [];
@@ -283,33 +100,47 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
       const v = cellVal(c, s);
       if (v > 0) cells.push({ color: c, size: String(s), qty: v });
     }
-    if (cells.length === 0) {
-      setErr("Enter at least one non-zero cell to produce.");
-      setBusy(false);
-      return;
-    }
-    // Fire produce-cell for each cell sequentially — one failing cell (e.g.
-    // "no production card") shouldn't stop the whole batch.
     const ok = [], errors = [];
+    let pendingShortage = null;
     for (const cell of cells) {
       try {
         const { data } = await http.post("/production/produce-cell", {
-          style_id:       style.id,
-          color:          cell.color,
-          size:           cell.size,
-          produced_qty:   cell.qty,
-          use_components: useComponents,
-          channel_filter: "online_channel",
+          style_id:              style.id,
+          color:                 cell.color,
+          size:                  cell.size,
+          produced_qty:          cell.qty,
+          use_components:        useComponents,
+          channel_filter:        "online_channel",
+          force_negative_stock:  !!force,
         });
         ok.push({ ...cell, ...data });
       } catch (e) {
         const d = e.response?.data?.detail;
+        if (d && typeof d === "object" && d.code === "component_shortage" && !force) {
+          // Aggregate the shortage — one confirm covers the rest of the batch.
+          pendingShortage = { cell, shortages: d.shortages || [] };
+          break;
+        }
         const msg = (d && typeof d === "object" && d.message) ? d.message : friendlyAxiosError(e);
         errors.push({ ...cell, error: msg });
       }
     }
-    setResults({ ok, errors });
     setBusy(false);
+    if (pendingShortage) {
+      setShortageConfirm({
+        shortages: pendingShortage.shortages,
+        onConfirm: () => { setShortageConfirm(null); runProduction(true); },
+        onCancel:  () => { setShortageConfirm(null); setResults({ ok, errors }); },
+      });
+      return;
+    }
+    setResults({ ok, errors });
+  };
+
+  const submit = () => {
+    const cells = colors.flatMap((c) => sizes.map((s) => cellVal(c, s))).filter((v) => v > 0);
+    if (cells.length === 0) { setErr("Enter at least one non-zero cell to produce."); return; }
+    runProduction(false);
   };
 
   return (
@@ -461,7 +292,7 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
 
             <label className="flex items-start gap-2 cursor-pointer text-xs pt-1">
               <input type="checkbox" checked={useComponents} onChange={(e) => setUseComp(e.target.checked)} className="mt-0.5" data-testid="adhoc-use-components" />
-              <span>
+              <span className="flex-1">
                 <span className="font-bold uppercase tracking-wider">Deduct from Component Inventory</span><br />
                 <span className="text-slate-500">
                   Uncheck to produce directly from raw material without a BOM.
@@ -469,6 +300,41 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
                 </span>
               </span>
             </label>
+
+            {/* Live feasibility indicator */}
+            {useComponents && grandTotal > 0 && feasibility && (
+              <div
+                className={`p-2 border-2 text-xs ${
+                  feasibility.missing_bom
+                    ? "border-amber-400 bg-amber-50 text-amber-900"
+                    : feasibility.feasible
+                    ? "border-emerald-400 bg-emerald-50 text-emerald-900"
+                    : "border-red-400 bg-red-50 text-red-900"
+                }`}
+                data-testid="adhoc-feasibility"
+              >
+                {feasibility.missing_bom ? (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5 inline mr-1" />
+                    No production card mapped. Click <strong>Edit Production Card</strong> or turn off the toggle above.
+                  </>
+                ) : feasibility.feasible ? (
+                  <>
+                    <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />
+                    BOM feasible for {grandTotal} pairs — all components have enough stock.
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5 inline mr-1" />
+                    <strong>Shortage:</strong>{" "}
+                    {feasibility.components.filter((c) => c.shortfall > 0)
+                      .map((c) => `${c.component_code} (need ${c.needed}, have ${c.available}, short ${c.shortfall})`)
+                      .join(" · ")}
+                    <div className="mt-0.5 text-[10px]">You&apos;ll be asked to confirm before stock goes below zero.</div>
+                  </>
+                )}
+              </div>
+            )}
 
             {err && (
               <div className="p-2 border-2 border-red-300 bg-red-50 text-red-900 text-xs" data-testid="adhoc-error">{err}</div>
@@ -485,6 +351,53 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
           </div>
         )}
       </div>
+
+      {shortageConfirm && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4"
+          onClick={shortageConfirm.onCancel}
+          data-testid="shortage-confirm-modal"
+        >
+          <div
+            className="bg-white w-full max-w-md border-2 border-red-500 shadow-ind-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-3 border-b-2 border-red-500 bg-red-50 flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-red-700" />
+              <div className="font-black text-red-900">Component shortage — proceed anyway?</div>
+            </div>
+            <div className="p-5 space-y-3 text-sm">
+              <p className="text-slate-700">
+                This production run will drive the following components below zero:
+              </p>
+              <div className="border-2 border-red-200 divide-y divide-red-200">
+                {shortageConfirm.shortages.map((s, i) => (
+                  <div key={i} className="px-3 py-2 flex items-baseline justify-between gap-2 text-xs">
+                    <div>
+                      <div className="font-mono font-bold">{s.component_code}</div>
+                      <div className="text-slate-500">{s.component_name}</div>
+                    </div>
+                    <div className="text-right font-mono">
+                      <div>need <strong>{s.needed}</strong></div>
+                      <div>have <strong>{s.available}</strong></div>
+                      <div className="text-red-700">→ short {s.shortfall}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                If you proceed, component stock will go negative and a warning will remain in the ledger until inventory is topped up.
+              </p>
+              <div className="flex gap-2">
+                <BtnSecondary onClick={shortageConfirm.onCancel} className="flex-1" data-testid="shortage-cancel">Cancel</BtnSecondary>
+                <BtnPrimary onClick={shortageConfirm.onConfirm} className="flex-1 !bg-red-700 !border-red-700 hover:!bg-red-800" data-testid="shortage-proceed">
+                  Proceed anyway
+                </BtnPrimary>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

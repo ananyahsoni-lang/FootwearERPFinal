@@ -52,7 +52,6 @@ const navGroups = [
       { to: "/picklists", label: "Picklists", icon: ClipboardList, roles: ["admin", "manager", "production"] },
       { to: "/warehouse/reports", label: "Warehouse Reports", icon: BarChart3, roles: ["admin", "manager"] },
       { to: "/pending-list", label: "Pending Product List", icon: PackageOpen, roles: ["admin", "manager", "production"] },
-      { to: "/online-production-floor", label: "Production Floor", icon: Hammer, roles: ["admin", "manager", "production"] },
     ]
   }
 ];

@@ -10189,12 +10189,19 @@ async def list_online_orders(
 
 # ---------- PRODUCTION ----------
 @api.get("/production/jobs")
-async def list_jobs(request: Request, include_archived: bool = False):
+async def list_jobs(request: Request, include_archived: bool = False, source_type: Optional[str] = "b2b_client"):
+    """List production jobs. Default `source_type=b2b_client` — Online orders
+    are handled entirely inside Online Commerce (Ready Stock + Pending List)
+    and shouldn't appear on the B2B Kanban since they never produce an invoice.
+    Pass `source_type=all` to see everything, or `source_type=online_channel`
+    for online-only.
+    """
     await get_current_user(request)
     q: dict = {}
     if not include_archived:
-        # Hide jobs that have both invoice + packing list generated
         q = {"archived": {"$ne": True}}
+    if source_type and source_type != "all":
+        q["source_type"] = source_type
     docs = await db.production_jobs.find(q).sort("created_at", -1).to_list(2000)
     return [stringify(d) for d in docs]
 
@@ -12516,6 +12523,7 @@ class ProduceCellIn(BaseModel):
     use_components: bool          = True     # False = "raw material mode", no component_stock deduct
     channel_filter: Optional[str] = None     # if set, only pending jobs from this source get consumed
     dispatch_stage: Optional[str] = "dispatched"
+    force_negative_stock: bool    = False    # explicit override to allow deducting past zero
 
 
 async def _find_style_home_cell(style_id: str) -> Optional[str]:
@@ -12613,8 +12621,16 @@ async def produce_cell(request: Request, payload: ProduceCellIn):
                             "Create one before consuming components — or set use_components=false to skip.",
                  "style_id": payload.style_id, "style_code": style_code},
             )
+        # ---- Pre-flight feasibility check -----------------------------------
+        # Compute how much each component this batch would deduct BEFORE we
+        # touch component_master, so we can either:
+        #   (a) block the run with a `component_shortage` error, or
+        #   (b) proceed anyway if the operator explicitly opted in
+        #       (`force_negative_stock=True`).
+        shortages: list[dict] = []
+        deductions: list[tuple[dict, int]] = []
         for b in bom:
-            per = float(b.get("quantity_per_pair", 1) or 1)
+            per   = float(b.get("quantity_per_pair", 1) or 1)
             waste = float(b.get("wastage_percent", 0) or 0) / 100.0
             deduct = int(round(produced * per * (1 + waste)))
             if deduct <= 0:
@@ -12622,6 +12638,28 @@ async def produce_cell(request: Request, payload: ProduceCellIn):
             comp = await db.component_master.find_one({"_id": ObjectId(b["component_id"])})
             if not comp:
                 continue
+            current = int(comp.get("current_stock", 0))
+            if deduct > current:
+                shortages.append({
+                    "component_id":   str(comp["_id"]),
+                    "component_code": comp.get("component_code"),
+                    "component_name": comp.get("component_name"),
+                    "needed":         deduct,
+                    "available":      current,
+                    "shortfall":      deduct - current,
+                })
+            deductions.append((comp, deduct))
+        if shortages and not payload.force_negative_stock:
+            raise HTTPException(
+                409,
+                {"code": "component_shortage",
+                 "message": f"{len(shortages)} component(s) would go below zero. Re-submit with force_negative_stock=true to proceed anyway.",
+                 "style_code": style_code,
+                 "produced":   produced,
+                 "shortages":  shortages},
+            )
+        # Apply the deductions (we already have `comp` fetched above, no double round-trip)
+        for comp, deduct in deductions:
             new_stock = int(comp.get("current_stock", 0)) - deduct
             await db.component_master.update_one(
                 {"_id": comp["_id"]},
@@ -12787,11 +12825,7 @@ async def list_short_production(request: Request, style_code: Optional[str] = No
 @api.get("/production/style-variants/{sid}")
 async def style_variants(sid: str, request: Request):
     """Return every (color, size) pair we've ever seen for this style — used by
-    the Online Production Floor ad-hoc drawer to pre-fill its color × size
-    matrix. Sources: fg_location_inventory (physical stock), production_jobs
-    (in-flight), style_lifecycle.planned_{colors,sizes} (aspirational), and
-    style.base_size.
-    """
+    the ad-hoc production matrix to pre-fill rows/cols."""
     await get_current_user(request)
     try:
         sid_oid = ObjectId(sid)
@@ -12821,6 +12855,49 @@ async def style_variants(sid: str, request: Request):
         "colors": sorted(colors),
         "sizes":  sorted(sizes, key=_sortsz),
     }
+
+
+@api.get("/production/bom-feasibility/{sid}")
+async def bom_feasibility(sid: str, request: Request, pairs: int = 1):
+    """Preview whether a run of `pairs` pairs of style `sid` can be produced
+    with the current component_master stock (using the style's active BOM).
+    Returns: {feasible: bool, components: [{code, name, needed, available, shortfall}], missing_bom: bool}.
+    """
+    await get_current_user(request)
+    if pairs <= 0:
+        return {"feasible": True, "components": [], "missing_bom": False, "pairs": 0}
+    try:
+        oid_v = ObjectId(sid)
+    except Exception:
+        raise HTTPException(400, "Invalid style_id")
+    bom = await db.style_component_mapping.find({
+        "style_id": oid_v, "active": {"$ne": False},
+    }).to_list(200)
+    if not bom:
+        return {"feasible": False, "components": [], "missing_bom": True, "pairs": pairs}
+
+    comps = []
+    feasible = True
+    for b in bom:
+        per   = float(b.get("quantity_per_pair", 1) or 1)
+        waste = float(b.get("wastage_percent", 0) or 0) / 100.0
+        needed = int(round(pairs * per * (1 + waste)))
+        cm = await db.component_master.find_one({"_id": ObjectId(b["component_id"])})
+        if not cm:
+            continue
+        available = int(cm.get("current_stock", 0))
+        short = max(0, needed - available)
+        if short > 0:
+            feasible = False
+        comps.append({
+            "component_id":   str(cm["_id"]),
+            "component_code": cm.get("component_code"),
+            "component_name": cm.get("component_name"),
+            "needed":         needed,
+            "available":      available,
+            "shortfall":      short,
+        })
+    return {"feasible": feasible, "components": comps, "missing_bom": False, "pairs": pairs}
 
 
 # ═══════════════════════════════════════════════════════════════════════

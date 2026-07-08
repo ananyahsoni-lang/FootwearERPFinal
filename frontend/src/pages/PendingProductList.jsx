@@ -360,7 +360,7 @@ function ProduceCellDrawer({ ctx, onClose, onDone }) {
   const isShort = producedQty < ctx.pending;
   const isOver  = producedQty > ctx.pending;
 
-  const submit = async () => {
+  const submit = async (force = false) => {
     setErr(""); setBusy(true); setResult(null);
     try {
       if (isShort && !reason.trim()) {
@@ -369,19 +369,32 @@ function ProduceCellDrawer({ ctx, onClose, onDone }) {
         return;
       }
       const { data } = await http.post("/production/produce-cell", {
-        style_id:       ctx.style_id,
-        color:          ctx.color,
-        size:           ctx.size,
-        produced_qty:   Number(producedQty),
-        reason:         reason.trim(),
-        use_components: useComponents,
-        channel_filter: "online_channel",
+        style_id:              ctx.style_id,
+        color:                 ctx.color,
+        size:                  ctx.size,
+        produced_qty:          Number(producedQty),
+        reason:                reason.trim(),
+        use_components:        useComponents,
+        channel_filter:        "online_channel",
+        force_negative_stock:  force,
       });
       setResult(data);
     } catch (e) {
       const detail = e.response?.data?.detail;
       if (detail && typeof detail === "object" && detail.code === "no_production_card") {
         setNeedCard(true);
+      } else if (detail && typeof detail === "object" && detail.code === "component_shortage") {
+        // Ask the operator to explicitly opt into negative stock.
+        const parts = (detail.shortages || []).map(
+          (s) => `${s.component_code} (need ${s.needed}, have ${s.available}, short ${s.shortfall})`
+        ).join("\n");
+        if (window.confirm(
+          "Component shortage — the following will go below zero:\n\n" + parts +
+          "\n\nProceed anyway? Stock will go negative and remain flagged in the ledger."
+        )) {
+          submit(true);
+          return;
+        }
       } else {
         setErr(friendlyAxiosError(e));
       }
