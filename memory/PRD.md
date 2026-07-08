@@ -49,3 +49,18 @@
 - Forgot-password (unknown email): returns generic OK — no leak, no dev link.
 - Reset flow: token from dev link accepts new password, login succeeds with the new password, second use of the same token → HTTP 400 "already used".
 - Password restored via a new forgot round-trip so admin creds match `.env` again.
+
+## Iteration 24 (2026-07-08) — Share-link image URLs auto-resolve
+### Problem
+- Pasting a Dropbox share URL (`https://www.dropbox.com/scl/fi/…?dl=0`) into the Style image field showed a broken image. Same for OneDrive + Google Drive shares.
+
+### Fix
+- New `normalize_image_url()` helper in **both** frontend (`ImageUploader.jsx#pasteUrl`) and backend (`server.py`) — mirrored transforms:
+  - Dropbox `www.dropbox.com/{s,scl/fi}/…?dl=0` → `dl.dropboxusercontent.com/…` (dl param stripped).
+  - OneDrive `1drv.ms/…` or `*.onedrive.live.com/…` → `api.onedrive.com/v1.0/shares/u!<b64url>/root/content`.
+  - Google Drive `/file/d/<id>/view` or `?id=<id>` → `drive.google.com/uc?export=view&id=<id>`.
+- Applied to `POST/PATCH /api/styles`, `POST /api/styles/bulk/preview`, and `POST /api/styles/bulk` so both interactive edits and Excel bulk imports get the same treatment.
+
+### Verified
+- User-provided Dropbox link resolved: image renders on the SSK_00001 card in Styles page. Underlying `dl.dropboxusercontent.com` URL returns a 322KB JPEG (verified via curl + magic-byte check `ff d8 ff …`).
+- Unit tests for all four rules pass (dropbox `/s/`, dropbox `/scl/fi/`, onedrive shortlink, onedrive full, gdrive `/file/d/`, gdrive `?id=`, already-normalized passthrough, plain URL passthrough, empty).

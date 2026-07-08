@@ -216,6 +216,49 @@ def resolve_local_upload_path(url: str) -> Optional[str]:
     return fs_path if os.path.isfile(fs_path) else None
 
 
+def normalize_image_url(raw: str) -> str:
+    """Rewrite common share-link formats (Dropbox / OneDrive / Google Drive)
+    to direct-download URLs that a browser <img> tag or PDF renderer can pull
+    without an HTML redirect.
+
+    Frontend does the same transform on paste; we mirror it server-side so
+    Excel bulk imports (which never touch the paste-handler) work too.
+    Returns the input unchanged if no rule matches.
+    """
+    import base64 as _b64
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    if not raw or not isinstance(raw, str):
+        return raw
+    val = raw.strip()
+    if not val:
+        return val
+    try:
+        parts = urlsplit(val)
+    except Exception:
+        return val
+    host = (parts.hostname or "").lower()
+
+    # ---- DROPBOX ----------------------------------------------------------
+    if host.endswith("dropbox.com") and host != "dl.dropboxusercontent.com":
+        qs = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "dl"]
+        return urlunsplit((parts.scheme, "dl.dropboxusercontent.com", parts.path, urlencode(qs), ""))
+
+    # ---- ONEDRIVE (1drv.ms shortlink OR onedrive.live.com share) ----------
+    if host == "1drv.ms" or host.endswith("onedrive.live.com"):
+        b = _b64.urlsafe_b64encode(val.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"https://api.onedrive.com/v1.0/shares/u!{b}/root/content"
+
+    # ---- GOOGLE DRIVE -----------------------------------------------------
+    if host.endswith("drive.google.com"):
+        import re as _re
+        m = _re.search(r"/file/d/([^/]+)", parts.path or "")
+        gid = m.group(1) if m else dict(parse_qsl(parts.query)).get("id")
+        if gid:
+            return f"https://drive.google.com/uc?export=view&id={gid}"
+
+    return val
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ssk")
 
@@ -3648,6 +3691,8 @@ async def bulk_upload_preview(file: UploadFile = File(...), request: Request = N
                     except:
                         pass
                         
+        _raw_url = str(row.get("image_url", "")).strip() if pd.notna(row.get("image_url")) else ""
+        _norm_url = normalize_image_url(_raw_url)
         preview.append({
             "code": code,
             "name": name,
@@ -3658,11 +3703,11 @@ async def bulk_upload_preview(file: UploadFile = File(...), request: Request = N
             "packing_cost": float(row.get("packing_cost", 0)) if pd.notna(row.get("packing_cost")) else 0,
             "margin_pct": float(row.get("margin_pct", 25)) if pd.notna(row.get("margin_pct")) else 25,
             "gst_pct": float(row.get("gst_pct", 5)) if pd.notna(row.get("gst_pct")) else 5,
-            "image_url": str(row.get("image_url", "")).strip() if pd.notna(row.get("image_url")) else "",
+            "image_url": _norm_url,
             # Preview mirrors bulk-import: raw URL is echoed into all three
             # variants for the frontend's SafeImage fallback chain.
-            "image_display_url":   str(row.get("image_url", "")).strip() if pd.notna(row.get("image_url")) else "",
-            "image_thumbnail_url": str(row.get("image_url", "")).strip() if pd.notna(row.get("image_url")) else "",
+            "image_display_url":   _norm_url,
+            "image_thumbnail_url": _norm_url,
             "labor": labor
         })
                     
@@ -3697,13 +3742,13 @@ async def bulk_upload_styles(payload: dict, request: Request = None):
                 "packing_cost": float(row.get("packing_cost", 0)),
                 "margin_pct": float(row.get("margin_pct", 25)),
                 "gst_pct": float(row.get("gst_pct", 5)),
-                "image_url": row.get("image_url", ""),
+                "image_url": normalize_image_url(row.get("image_url", "")),
                 # Bulk / CSV imports carry a single externally-supplied URL —
                 # no Pillow re-encode was run on it. Mirror the raw URL into
                 # display_url and thumbnail_url so the frontend's fallback
                 # chain still finds *something* to render (Phase 3 spec).
-                "image_display_url":   row.get("image_display_url")   or row.get("image_url", ""),
-                "image_thumbnail_url": row.get("image_thumbnail_url") or row.get("image_url", ""),
+                "image_display_url":   normalize_image_url(row.get("image_display_url")   or row.get("image_url", "")),
+                "image_thumbnail_url": normalize_image_url(row.get("image_thumbnail_url") or row.get("image_url", "")),
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
@@ -3747,6 +3792,13 @@ async def create_style(payload: StyleIn, request: Request):
     # System ALWAYS generates the style code — any user-supplied `code` is
     # ignored to guarantee uniqueness and format consistency (SSK_XXXXX).
     doc = payload.model_dump()
+    # Normalize share-link URLs (Dropbox/OneDrive/Drive) so that a browser <img>
+    # tag and the PDF renderer can fetch them directly.
+    _u = normalize_image_url(doc.get("image_url", "") or "")
+    if _u:
+        doc["image_url"] = _u
+        if not doc.get("image_display_url"):   doc["image_display_url"]   = _u
+        if not doc.get("image_thumbnail_url"): doc["image_thumbnail_url"] = _u
     # Retry loop to survive the (astronomically unlikely) case where two
     # concurrent creates receive the same seq before the unique index is hit.
     generated_code = None
@@ -3779,6 +3831,13 @@ async def update_style(sid: str, payload: StyleIn, request: Request):
     if not existing:
         raise HTTPException(404, "Style not found")
     update = payload.model_dump()
+    # Normalize share-link URLs (Dropbox/OneDrive/Drive) so that <img> and the
+    # PDF renderer can fetch them directly.
+    _u = normalize_image_url(update.get("image_url", "") or "")
+    if _u:
+        update["image_url"] = _u
+        if not update.get("image_display_url"):   update["image_display_url"]   = _u
+        if not update.get("image_thumbnail_url"): update["image_thumbnail_url"] = _u
     # style.code is IMMUTABLE — silently drop any incoming value so it can
     # never drift from the SSK_XXXXX assigned at creation.
     supplied_code = (update.pop("code", "") or "").strip()

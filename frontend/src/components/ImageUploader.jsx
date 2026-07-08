@@ -89,10 +89,69 @@ export default function ImageUploader({
     setErr("");
   };
 
-  const pasteUrl = (e) => {
-    let val = e.target.value;
+  /**
+   * Normalize common share-link formats (Dropbox, OneDrive, Google Drive) to
+   * direct-download URLs the browser's <img> tag can actually render.
+   * - Dropbox share (www.dropbox.com/...?dl=0)
+   *     → dl.dropboxusercontent.com/... (or dl=1); works for both /s/ and /scl/fi/ paths.
+   * - OneDrive short (1drv.ms) + full share URLs
+   *     → api.onedrive.com/v1.0/shares/u!<b64url>/root/content
+   * - Google Drive share (/file/d/<id>/view or open?id=<id>)
+   *     → drive.google.com/uc?export=view&id=<id>
+   * Returns the original string if no rule matched.
+   */
+  const normalizeImageUrl = (raw) => {
+    if (!raw || typeof raw !== "string") return raw;
+    let val = raw.trim();
+    // Strip anything wrapped in HTML like <img src="...">
     const srcMatch = val.match(/src=["'](.*?)["']/i);
     if (srcMatch && srcMatch[1]) val = srcMatch[1];
+
+    try {
+      const u = new URL(val);
+
+      // ---- DROPBOX --------------------------------------------------------
+      // www.dropbox.com/s/… or www.dropbox.com/scl/fi/… — swap host + drop dl=0.
+      if (/(^|\.)dropbox\.com$/i.test(u.hostname) && u.hostname !== "dl.dropboxusercontent.com") {
+        u.hostname = "dl.dropboxusercontent.com";
+        // Some Dropbox links carry `dl=0`; the direct host ignores it but we
+        // strip it for cleanliness. Also handle the (rarer) `raw=1` param.
+        u.searchParams.delete("dl");
+        return u.toString();
+      }
+
+      // ---- ONEDRIVE (1drv.ms shortlink OR onedrive.live.com share URL) ----
+      // The public "shares API" trick: base64url-encode the FULL share URL
+      // and open it at /shares/u!<b64>/root/content — returns the raw file
+      // and works from <img> tags (no auth needed for anyone-with-link shares).
+      if (
+        u.hostname === "1drv.ms" ||
+        /(^|\.)onedrive\.live\.com$/i.test(u.hostname)
+      ) {
+        const b64 = btoa(val)
+          .replace(/=+$/g, "") // strip padding
+          .replace(/\//g, "_")
+          .replace(/\+/g, "-");
+        return `https://api.onedrive.com/v1.0/shares/u!${b64}/root/content`;
+      }
+
+      // ---- GOOGLE DRIVE ---------------------------------------------------
+      if (/(^|\.)drive\.google\.com$/i.test(u.hostname)) {
+        // /file/d/<id>/view  or  /file/d/<id>/edit
+        const m = u.pathname.match(/\/file\/d\/([^/]+)/);
+        const id = m ? m[1] : u.searchParams.get("id");
+        if (id) {
+          return `https://drive.google.com/uc?export=view&id=${id}`;
+        }
+      }
+    } catch {
+      // Not a valid URL — return as-is so the user sees their own input.
+    }
+    return val;
+  };
+
+  const pasteUrl = (e) => {
+    const val = normalizeImageUrl(e.target.value);
     onChange({
       url: val,
       original_url: val,
