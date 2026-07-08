@@ -31,6 +31,7 @@ import Picklists from "@/pages/Picklists";
 import WarehouseReports from "@/pages/WarehouseReports";
 import WarehouseQRSheet from "@/pages/WarehouseQRSheet";
 import PendingProductList from "@/pages/PendingProductList";
+import OnlineProductionFloor from "@/pages/OnlineProductionFloor";
 import ListingFormats from "@/pages/ListingFormats";
 import OrderImportFormats from "@/pages/OrderImportFormats";
 import SelectWorkspace from "@/pages/SelectWorkspace";
@@ -93,6 +94,7 @@ function App() {
             <Route path="warehouse/reports" element={<WarehouseReports />} />
             <Route path="warehouse/qr" element={<WarehouseQRSheet />} />
             <Route path="pending-list" element={<PendingProductList />} />
+            <Route path="online-production-floor" element={<OnlineProductionFloor />} />
             <Route path="listing-formats" element={<ListingFormats />} />
             <Route path="order-import-formats" element={<OrderImportFormats />} />
             <Route path="settings" element={<Settings />} />

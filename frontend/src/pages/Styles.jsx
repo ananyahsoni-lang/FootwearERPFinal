@@ -12,6 +12,7 @@ import {
 } from "../components/ui-kit";
 import { Drawer } from "./Materials";
 import ImageUploader, { ImageThumb, SafeImage } from "../components/ImageUploader";
+import BomEditorDrawer from "../components/BomEditorDrawer";
 import {
   Plus,
   Trash2,
@@ -22,6 +23,7 @@ import {
   Download,
   ArrowLeftRight,
   Globe2,
+  Wrench,
 } from "lucide-react";
 
 const ONLINE_CHANNELS = ["myntra", "flipkart", "nykaa", "website"];
@@ -65,6 +67,7 @@ const emptyStyle = {
 
 export default function Styles() {
   const [styles, setStyles] = useState([]);
+  const [bomStyle, setBomStyle] = useState(null);
   const [materials, setMaterials] = useState([]);
   const [open, setOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -726,6 +729,14 @@ export default function Styles() {
                       }`}
                     >
                       <Globe2 className="w-3.5 h-3.5 inline" />
+                    </button>
+                    <button
+                      onClick={() => setBomStyle(s)}
+                      title="Edit Production Card (BOM)"
+                      data-testid={`bom-edit-${s.code}`}
+                      className="px-3 py-2 border-2 border-slate-300 hover:border-emerald-500 hover:text-emerald-600 text-xs"
+                    >
+                      <Wrench className="w-3.5 h-3.5" />
                     </button>
                     <button
                       onClick={() => remove(s.id)}
@@ -1765,6 +1776,12 @@ export default function Styles() {
         onConfirm={confirm?.onConfirm}
         onCancel={() => setConfirm(null)}
       />
+      {bomStyle && (
+        <BomEditorDrawer
+          style={bomStyle}
+          onClose={() => setBomStyle(null)}
+        />
+      )}
     </div>
   );
 }

@@ -114,3 +114,23 @@ python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 - Tan/Size 7 (pending 8, produced 12) → dispatched, 4 excess auto-placed at `01-A-01` (SSK_00001's home cell).
 - Tan/Size 8 (pending 12, produced 5) → short-log row inserted with reason "Sole vendor supply delayed", 7 pairs remain on pending list.
 - Pending list group count dropped from 5 → 4 after Brown/9 fully dispatched.
+
+## Iteration 27 (2026-07-08) — Dedicated Online Production Floor + Full BOM editor
+### What changed
+- **New page**: `Online Production Floor` (`/online-production-floor`) — sits under the **Online Commerce** sidebar. Ad-hoc / on-demand production with no PO gate. Lists every style opted-in to the Online Pipeline as a card with product image, online status badge, and either a "1 components" or "No BOM" state chip.
+- **Every style card exposes two actions**:
+  - `Create/Edit Production Card` → opens `BomEditorDrawer` (shared component).
+  - `Produce` → opens `AdHocProduceDrawer` — pick color/size/qty → posts to the existing `/production/produce-cell` endpoint. Any pending online jobs are consumed first; the rest lands in the style's home rack as excess (same logic as Pending List). Zero code duplication.
+- **BOM edit UI on Styles page** — every style card in the Styles master gained a wrench-icon button (`data-testid="bom-edit-{code}"`) that opens the same `BomEditorDrawer`. This is the "revise/deactivate individual components later" feature the user asked for.
+- **`BomEditorDrawer`** (`/frontend/src/components/BomEditorDrawer.jsx`): inline-editable table of BOM rows with:
+  - Per-row `Qty/pair`, `Waste %` inputs (dirty-state tracked; save icon appears on edit).
+  - Active/Inactive toggle (deactivate temporarily instead of deleting to preserve history).
+  - Delete (with confirm) via `DELETE /style-component-mapping/{mid}`.
+  - Add-new row at the bottom with a smart component picker (hides components already mapped to avoid duplicate key errors).
+- Sidebar entry + route registered in `AppShell.jsx` + `App.js`.
+
+### Verified
+- Two demo styles seeded into the pipeline (SSK_00001 · live · 1 component; SSK_00004 · draft · No BOM).
+- Screenshots confirm floor renders correctly with product images and state-appropriate buttons.
+- BOM drawer opens for SSK_00001, shows its UPP-TAN-01 mapping with editable qty/waste/active toggle + add-new row.
+- Zero backend changes needed — reuses `/style-component-mapping` (already had list/create/update/delete) and `/production/produce-cell` (already had all four modes).
