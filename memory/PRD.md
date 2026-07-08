@@ -86,3 +86,31 @@ cd /app/backend
 python -m seed_demo             # seed (idempotent — safe to re-run)
 python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 ```
+
+## Iteration 26 (2026-07-08) — Warehouse rebuild + Clickable Pending List + Production floor for Online (BOM-driven component deduction)
+### Warehouse layout overhaul (choice 1a + 2b)
+- Constants updated: **RACKS=[A,B,C], ROWS_PER=10 (lines), COLS_PER=8 (cells), CAPACITY=40 pairs** → total **240 cells / 9,600 pair capacity**.
+- Naming: `{line:02d}-{rack}-{cell:02d}` → `01-A-01` … `10-C-08`.
+- New admin endpoint `POST /api/warehouse/rebuild-layout` — DESTRUCTIVE. Drops all `warehouse_locations`, re-seeds the 240 cells, and MIGRATES existing `fg_location_inventory` into the new layout, preferring cells already assigned to a style (so per-style stock stays clustered — matches the "already allotted rack" rule). Returns a migration report (dropped/inserted/migrated counts).
+- Verified: dropped 560 old cells → inserted 240 new @ 40 cap; 17 fg_location_inventory rows migrated to 3 style-home cells; 9,600 pair capacity total.
+
+### Clickable "Made" cell on Pending Product List (choice 3 — my call)
+- Each cell in the size × qty matrix is now a button → opens **ProduceCellDrawer** with a big stepper, "Produced all" preset, and a "Deduct from Component Inventory" toggle.
+- Backend: `POST /api/production/produce-cell` accepts `{style_id, color, size, produced_qty, reason?, use_components, channel_filter?}` and handles three cases:
+  - **produced == pending** → mark matching jobs `dispatched`.
+  - **produced <  pending** → dispatch the covered portion, keep the shortfall on the pending list, insert a `short_production_log` row (reason mandatory).
+  - **produced >  pending** → dispatch all matching + excess auto-added to `fg_stock` via `_apply_movement` AND placed in the style's already-allotted `fg_location_inventory` cell (or first empty main cell if the style has no cluster yet). Warehouse counters updated in the same transaction.
+- Component deduction: when `use_components=true` AND a BOM exists (`style_component_mapping`), each component is deducted from `component_master.current_stock` with `pairs × qty_per_pair × (1 + wastage%)`. Deduction logged in `component_master.history`.
+- **If style has no BOM** → endpoint returns HTTP **412 with `code: no_production_card`**; frontend shows a `NoProductionCardPrompt` sub-drawer where the operator picks components from a dropdown (populated from `/api/components`), sets qty-per-pair + wastage%, and saves via `POST /api/production/production-card`. System remembers the mapping — auto-deducts on every future production for that style.
+- New endpoint `GET /api/production/short-log` returns the historical short-production audit trail.
+- Frontend: `PendingProductList` now filters out fully-produced groups automatically and reflects `quantity - completed_qty` per cell, so the matrix stays accurate after each produce cycle.
+
+### Reuse of B2B production floor (choice 4a)
+- No new "online production" page. The pending list itself IS the online production floor now — cells are actionable, no PO required (unlike B2B where PO drives production).
+- Optional `channel_filter=online_channel` on produce-cell restricts consumption to online jobs only, so B2B and online can coexist without accidental cross-consumption.
+
+### Verified end-to-end
+- Brown/Size 9 (pending 6, produced 6) → dispatched, 6 UPP-TAN-01 components deducted (100 → 94, then 87 → 76 across produce runs).
+- Tan/Size 7 (pending 8, produced 12) → dispatched, 4 excess auto-placed at `01-A-01` (SSK_00001's home cell).
+- Tan/Size 8 (pending 12, produced 5) → short-log row inserted with reason "Sole vendor supply delayed", 7 pairs remain on pending list.
+- Pending list group count dropped from 5 → 4 after Brown/9 fully dispatched.

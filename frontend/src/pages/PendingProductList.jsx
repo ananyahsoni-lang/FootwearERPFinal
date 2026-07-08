@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { http, friendlyAxiosError } from "../lib/api";
-import { PageHeader, Card, BtnSecondary, Badge } from "../components/ui-kit";
+import { PageHeader, Card, BtnPrimary, BtnSecondary, Badge, Input } from "../components/ui-kit";
 import { SafeImage } from "../components/ImageUploader";
-import { Printer, RefreshCw, Package, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { Printer, RefreshCw, AlertTriangle, CheckCircle2, X, Wrench, Loader2 } from "lucide-react";
 
 /**
  * Groups pending production jobs into a (style_code, color) matrix so that
@@ -18,6 +18,7 @@ function useMatrix(rows) {
       const key = `${r.style_code || "—"}||${r.color || "—"}`;
       if (!map[key]) {
         map[key] = {
+          style_id:             r.style_id || "",
           style_code:           r.style_code || "—",
           style_name:           r.style_name || "",
           color:                r.color || "—",
@@ -33,8 +34,12 @@ function useMatrix(rows) {
       }
       const g = map[key];
       const sz = String(r.size || "—");
+      // Show the REMAINING pending count (raw quantity - completed_qty), not
+      // the original qty — otherwise cells appear "still open" after produce.
+      const pending = Math.max(0, Number(r.quantity || 0) - Number(r.completed_qty || 0));
+      if (pending <= 0) continue;
       if (!g.sizes[sz]) g.sizes[sz] = { qty: 0, jobs: 0, ready: true };
-      g.sizes[sz].qty  += Number(r.quantity || 0);
+      g.sizes[sz].qty  += pending;
       g.sizes[sz].jobs += 1;
       if (!r.components_available) {
         g.sizes[sz].ready = false;
@@ -46,10 +51,11 @@ function useMatrix(rows) {
           }
         });
       }
-      g.total += Number(r.quantity || 0);
+      g.total += pending;
       if (r.po_number) g.orders.add(r.po_number);
     }
     const groups = Object.values(map)
+      .filter((g) => g.total > 0)                          // hide fully-produced groups
       .map((g) => ({ ...g, orders: [...g.orders] }))
       .sort((a, b) => {
         // Rows with any shortage bubble to the top for attention
@@ -72,6 +78,9 @@ export default function PendingProductList() {
   const [loading, setLoad]  = useState(false);
   const [err, setErr]       = useState("");
   const [filter, setFilter] = useState("all"); // all | available | shortage
+
+  // Produce-cell drawer state (opened when operator taps a size cell)
+  const [produceCtx, setProduceCtx] = useState(null); // {style_id, style_code, style_name, color, size, pending, image}
 
   async function load() {
     setLoad(true); setErr("");
@@ -259,11 +268,36 @@ export default function PendingProductList() {
                       </tr>
                       <tr>
                         <td className="border border-slate-400 px-2 py-1 font-bold uppercase text-[10px]">Made</td>
-                        {allSizes.map((sz) => (
-                          <td key={sz} className="border border-slate-400 px-1 py-1 text-center">
-                            <div className="border-2 border-slate-500 w-5 h-5 mx-auto" />
-                          </td>
-                        ))}
+                        {allSizes.map((sz) => {
+                          const cell = g.sizes[sz];
+                          return (
+                            <td key={sz} className="border border-slate-400 px-1 py-1 text-center">
+                              {cell ? (
+                                <button
+                                  type="button"
+                                  data-testid={`made-cell-${g.style_code}-${g.color}-${sz}`}
+                                  onClick={() => setProduceCtx({
+                                    style_id:   g.style_id,
+                                    style_code: g.style_code,
+                                    style_name: g.style_name,
+                                    color:      g.color,
+                                    size:       sz,
+                                    pending:    cell.qty,
+                                    image:      {
+                                      url: g.image_url,
+                                      display_url: g.image_display_url,
+                                      thumbnail_url: g.image_thumbnail_url,
+                                    },
+                                  })}
+                                  className="border-2 border-slate-500 w-6 h-6 hover:bg-emerald-100 hover:border-emerald-600 active:bg-emerald-200 transition-colors mx-auto flex items-center justify-center print:cursor-default print:hover:bg-transparent"
+                                  title={`Record production for ${g.style_code} · ${g.color} · Size ${sz}`}
+                                />
+                              ) : (
+                                <div className="border border-slate-200 w-5 h-5 mx-auto" />
+                              )}
+                            </td>
+                          );
+                        })}
                         <td className="border border-slate-400 px-2 py-1 text-center">
                           <div className="border-2 border-slate-900 w-6 h-6 mx-auto" title="All done" />
                         </td>
@@ -294,6 +328,323 @@ export default function PendingProductList() {
           <span>Verified by: __________________________</span>
           <span>Date: __________</span>
         </div>
+      </div>
+
+      {produceCtx && (
+        <ProduceCellDrawer
+          ctx={produceCtx}
+          onClose={() => setProduceCtx(null)}
+          onDone={() => { setProduceCtx(null); load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+
+/* ────────────────────────────────────────────────────────────────
+   ProduceCellDrawer — opens when the operator clicks a Made cell.
+   Handles: produced-all / short (reason mandatory) / over (excess auto-
+   lands in the style's allotted rack), and prompts to create a production
+   card (BOM) if the style has none mapped yet.
+   ──────────────────────────────────────────────────────────────── */
+function ProduceCellDrawer({ ctx, onClose, onDone }) {
+  const [producedQty, setProducedQty] = useState(ctx.pending);
+  const [reason, setReason]           = useState("");
+  const [useComponents, setUseComp]   = useState(true);
+  const [busy, setBusy]               = useState(false);
+  const [err, setErr]                 = useState("");
+  const [result, setResult]           = useState(null);
+  const [needCard, setNeedCard]       = useState(false);
+
+  const isShort = producedQty < ctx.pending;
+  const isOver  = producedQty > ctx.pending;
+
+  const submit = async () => {
+    setErr(""); setBusy(true); setResult(null);
+    try {
+      if (isShort && !reason.trim()) {
+        setErr("Short production must include a reason.");
+        setBusy(false);
+        return;
+      }
+      const { data } = await http.post("/production/produce-cell", {
+        style_id:       ctx.style_id,
+        color:          ctx.color,
+        size:           ctx.size,
+        produced_qty:   Number(producedQty),
+        reason:         reason.trim(),
+        use_components: useComponents,
+        channel_filter: "online_channel",
+      });
+      setResult(data);
+    } catch (e) {
+      const detail = e.response?.data?.detail;
+      if (detail && typeof detail === "object" && detail.code === "no_production_card") {
+        setNeedCard(true);
+      } else {
+        setErr(friendlyAxiosError(e));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-lg border-2 border-slate-900 shadow-ind-lg print:hidden"
+        onClick={(e) => e.stopPropagation()}
+        data-testid="produce-cell-drawer"
+      >
+        <div className="px-5 py-4 border-b-2 border-slate-900 bg-slate-50 flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <SafeImage image={ctx.image} alt={ctx.style_code} aspectRatio="1/1" className="w-14 h-14 flex-shrink-0" />
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Record Production</div>
+              <div className="font-mono font-black text-lg truncate">{ctx.style_code}</div>
+              <div className="text-xs text-slate-600 truncate">
+                {ctx.style_name && <>{ctx.style_name} · </>}
+                Color <span className="font-mono font-bold">{ctx.color}</span> ·
+                Size <span className="font-mono font-bold">{ctx.size}</span> ·
+                Pending <span className="font-mono font-bold">{ctx.pending}</span>
+              </div>
+            </div>
+          </div>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-900 text-xl font-bold" data-testid="produce-close">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {result ? (
+          <div className="p-5 space-y-3" data-testid="produce-result">
+            <div className="p-3 border-2 border-emerald-500 bg-emerald-50 text-emerald-900">
+              <div className="font-bold flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4" /> Recorded
+              </div>
+              <div className="text-xs mt-1 space-y-0.5">
+                <div>Produced <strong>{result.produced}</strong> of pending <strong>{result.pending_before}</strong> pairs.</div>
+                {result.shortfall > 0 && <div className="text-red-800">Shortfall: <strong>{result.shortfall}</strong> pairs · logged with reason.</div>}
+                {result.excess > 0 && <div className="text-blue-800">Excess: <strong>{result.excess}</strong> pairs placed at <strong className="font-mono">{result.excess_placed_at}</strong>.</div>}
+                {result.bom_components_used?.length > 0 && (
+                  <div>Components deducted: {result.bom_components_used.map(c => `${c.component_code} (-${c.deducted}, ${c.new_stock} left)`).join(", ")}</div>
+                )}
+                <div>Production jobs updated: <strong>{result.jobs_updated}</strong></div>
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <BtnPrimary onClick={onDone} data-testid="produce-done">Done</BtnPrimary>
+            </div>
+          </div>
+        ) : needCard ? (
+          <NoProductionCardPrompt
+            styleId={ctx.style_id}
+            styleCode={ctx.style_code}
+            onCancel={() => setNeedCard(false)}
+            onCreated={() => { setNeedCard(false); submit(); }}
+            onSkipComponents={() => { setNeedCard(false); setUseComp(false); }}
+          />
+        ) : (
+          <div className="p-5 space-y-4">
+            {/* Big produced-qty stepper */}
+            <div className="text-center">
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-1">Pairs produced</div>
+              <div className="flex items-center justify-center gap-2">
+                <button onClick={() => setProducedQty(Math.max(1, Number(producedQty) - 1))}
+                        className="w-10 h-10 border-2 border-slate-300 hover:border-slate-900 text-lg font-bold"
+                        data-testid="produce-minus">−</button>
+                <input
+                  type="number"
+                  value={producedQty}
+                  onChange={(e) => setProducedQty(Math.max(0, Number(e.target.value)))}
+                  className="w-24 border-2 border-slate-300 px-2 py-2 text-center font-mono font-black text-2xl"
+                  data-testid="produce-qty-input"
+                />
+                <button onClick={() => setProducedQty(Number(producedQty) + 1)}
+                        className="w-10 h-10 border-2 border-slate-300 hover:border-slate-900 text-lg font-bold"
+                        data-testid="produce-plus">+</button>
+              </div>
+              <div className="mt-2 flex justify-center gap-2 flex-wrap">
+                <button onClick={() => setProducedQty(ctx.pending)}
+                        className="text-[10px] uppercase tracking-wider font-bold px-2 py-1 border border-slate-300 hover:border-slate-900"
+                        data-testid="produce-preset-all">Produced all ({ctx.pending})</button>
+                <button onClick={() => setProducedQty(Math.max(1, Math.floor(ctx.pending / 2)))}
+                        className="text-[10px] uppercase tracking-wider font-bold px-2 py-1 border border-slate-300 hover:border-slate-900">Half</button>
+              </div>
+            </div>
+
+            {/* Delta hint */}
+            {(isShort || isOver) && (
+              <div className={`p-2 border-2 text-xs ${isShort ? "border-red-300 bg-red-50 text-red-900" : "border-blue-300 bg-blue-50 text-blue-900"}`}>
+                {isShort
+                  ? <>Short by <strong>{ctx.pending - producedQty}</strong> pairs — this shortfall stays on the pending list. Reason required below.</>
+                  : <>Excess of <strong>{producedQty - ctx.pending}</strong> pairs → auto-added to this style&apos;s allotted rack (or first empty cell if none).</>}
+              </div>
+            )}
+
+            {isShort && (
+              <div>
+                <label className="text-xs uppercase tracking-wider font-bold text-slate-600">Reason for short production *</label>
+                <textarea
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  rows={2}
+                  placeholder="e.g. Sole supplier delay; Karigar leave; Rework batch"
+                  className="w-full mt-1 border-2 border-slate-300 px-3 py-2 text-sm focus:border-red-500 focus:outline-none"
+                  data-testid="produce-reason"
+                />
+              </div>
+            )}
+
+            {/* Component consumption toggle */}
+            <label className="flex items-start gap-2 cursor-pointer text-xs">
+              <input
+                type="checkbox"
+                checked={useComponents}
+                onChange={(e) => setUseComp(e.target.checked)}
+                className="mt-0.5"
+                data-testid="produce-use-components"
+              />
+              <span>
+                <span className="font-bold uppercase tracking-wider">Deduct from Component Inventory</span>
+                <br />
+                <span className="text-slate-500">Uncheck if this batch is produced directly from raw material without pre-made components. When checked, the style must have a production card (BOM).</span>
+              </span>
+            </label>
+
+            {err && (
+              <div className="p-2 border-2 border-red-300 bg-red-50 text-red-900 text-xs" data-testid="produce-error">{err}</div>
+            )}
+
+            <div className="flex gap-2 pt-1">
+              <BtnSecondary onClick={onClose} className="flex-1">Cancel</BtnSecondary>
+              <BtnPrimary onClick={submit} disabled={busy || producedQty <= 0} className="flex-1" data-testid="produce-submit">
+                {busy && <Loader2 className="w-3.5 h-3.5 inline mr-1 animate-spin" />}
+                Confirm Production
+              </BtnPrimary>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+/* Sub-drawer shown when the style has no BOM yet. Loads components list,
+   lets the operator pick which ones this style consumes + qty-per-pair, and
+   POSTs a new production card. */
+function NoProductionCardPrompt({ styleId, styleCode, onCancel, onCreated, onSkipComponents }) {
+  const [components, setComponents] = useState([]);
+  const [picks, setPicks]           = useState([{ component_id: "", quantity_per_pair: 1, wastage_percent: 5 }]);
+  const [busy, setBusy]             = useState(false);
+  const [err, setErr]               = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await http.get("/components");
+        setComponents(r.data);
+      } catch (e) {
+        setErr(friendlyAxiosError(e));
+      }
+    })();
+  }, []);
+
+  const updatePick = (i, k, v) => setPicks(prev => prev.map((p, idx) => idx === i ? { ...p, [k]: v } : p));
+  const addPick    = () => setPicks(prev => [...prev, { component_id: "", quantity_per_pair: 1, wastage_percent: 5 }]);
+  const removePick = (i) => setPicks(prev => prev.filter((_, idx) => idx !== i));
+
+  const save = async () => {
+    setErr(""); setBusy(true);
+    try {
+      const cleaned = picks.filter(p => p.component_id).map(p => ({
+        component_id:      p.component_id,
+        quantity_per_pair: Number(p.quantity_per_pair) || 1,
+        wastage_percent:   Number(p.wastage_percent)   || 0,
+      }));
+      if (cleaned.length === 0) {
+        setErr("Add at least one component or skip components below.");
+        setBusy(false);
+        return;
+      }
+      await http.post("/production/production-card", { style_id: styleId, components: cleaned });
+      onCreated();
+    } catch (e) {
+      setErr(friendlyAxiosError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="p-5 space-y-4" data-testid="production-card-prompt">
+      <div className="p-3 border-2 border-amber-300 bg-amber-50 text-amber-900 text-xs">
+        <div className="font-bold uppercase tracking-wider flex items-center gap-1">
+          <Wrench className="w-3.5 h-3.5" /> No production card for {styleCode}
+        </div>
+        <div className="mt-1">
+          Map the components this style consumes per pair. We&apos;ll remember these picks and auto-deduct them from Component Inventory on every future production for {styleCode}.
+        </div>
+      </div>
+
+      {picks.map((p, i) => (
+        <div key={i} className="grid grid-cols-12 gap-2 items-end" data-testid={`bom-row-${i}`}>
+          <div className="col-span-6">
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Component</label>
+            <select
+              value={p.component_id}
+              onChange={(e) => updatePick(i, "component_id", e.target.value)}
+              className="w-full mt-0.5 border-2 border-slate-300 px-2 py-1.5 text-xs font-mono"
+              data-testid={`bom-row-${i}-component`}
+            >
+              <option value="">— pick component —</option>
+              {components.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.component_code} · {c.component_name}{c.color ? ` (${c.color})` : ""} · stock {c.current_stock}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="col-span-3">
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Qty / pair</label>
+            <input
+              type="number"
+              step="0.01"
+              value={p.quantity_per_pair}
+              onChange={(e) => updatePick(i, "quantity_per_pair", e.target.value)}
+              className="w-full mt-0.5 border-2 border-slate-300 px-2 py-1.5 text-xs font-mono text-right"
+            />
+          </div>
+          <div className="col-span-2">
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Waste %</label>
+            <input
+              type="number"
+              step="0.1"
+              value={p.wastage_percent}
+              onChange={(e) => updatePick(i, "wastage_percent", e.target.value)}
+              className="w-full mt-0.5 border-2 border-slate-300 px-2 py-1.5 text-xs font-mono text-right"
+            />
+          </div>
+          <div className="col-span-1 flex items-end justify-center">
+            {picks.length > 1 && (
+              <button onClick={() => removePick(i)} className="text-slate-500 hover:text-red-600 h-8" title="Remove">
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+      <button onClick={addPick} className="text-xs font-bold uppercase tracking-wider text-[#2563EB]">+ Add component</button>
+
+      {err && (<div className="p-2 border-2 border-red-300 bg-red-50 text-red-900 text-xs">{err}</div>)}
+
+      <div className="flex gap-2 pt-1">
+        <BtnSecondary onClick={onCancel} className="flex-1">Back</BtnSecondary>
+        <BtnSecondary onClick={onSkipComponents} className="flex-1" data-testid="bom-skip">Skip · Use raw material</BtnSecondary>
+        <BtnPrimary onClick={save} disabled={busy} className="flex-1" data-testid="bom-save">
+          {busy ? "Saving…" : "Save & Produce"}
+        </BtnPrimary>
       </div>
     </div>
   );

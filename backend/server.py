@@ -11446,31 +11446,33 @@ async def seed_demo(request: Request):
 #   • /online-orders/import auto-generates picklists for covered qty
 # ═══════════════════════════════════════════════════════════════════════
 
-RACKS      = ["A", "B", "C", "D"]
-ROWS_PER   = 10
-COLS_PER   = 8
-CAPACITY   = 30  # pairs per cell
+RACKS      = ["A", "B", "C"]     # 3 racks per line
+ROWS_PER   = 10                  # 10 lines top-to-bottom
+COLS_PER   = 8                   # 8 cells per rack
+CAPACITY   = 40                  # pairs per cell
+# → total capacity = 3 × 10 × 8 × 40 = 9,600 pairs across 240 cells.
 
 
 def _make_location_code(rack: str, row: int, col: int) -> str:
-    return f"{rack}-{row:02d}-{col:02d}"
+    # New naming: {line:02d}-{rack}-{cell:02d}  (e.g. "01-A-01" … "10-C-08")
+    # `rack` is the rack-letter A/B/C, `row` is the line 1-10, `col` is the cell 1-8.
+    return f"{row:02d}-{rack}-{col:02d}"
 
 
 async def _seed_warehouse_locations():
     """Idempotent — inserts any missing cells into warehouse_locations.
 
     Zones:
-    • main            — default for all cells; used by production_in, dispatched, etc.
-    • return_holding  — reserved bay for `return_in` movements (post-inspection returns
-                        move from here to main via `return_restocked`).
-                        Default: last row of rack D (D-10-01 through D-10-08 = 240 pair cap).
+    • main            — default for all cells.
+    • return_holding  — reserved bay for `return_in` movements. Default: last
+                        row of rack C (10-C-01 … 10-C-08 = 320 pair capacity).
     """
     to_upsert = []
     for rack in RACKS:
         for r in range(1, ROWS_PER + 1):
             for c in range(1, COLS_PER + 1):
                 code = _make_location_code(rack, r, c)
-                zone = "return_holding" if (rack == "D" and r == 10) else "main"
+                zone = "return_holding" if (rack == "C" and r == ROWS_PER) else "main"
                 to_upsert.append({
                     "location_code":   code,
                     "rack":            rack,
@@ -11496,11 +11498,12 @@ async def _seed_warehouse_locations():
         )
         if res.upserted_id:
             inserted += 1
-    # Backfill zone for any pre-existing cells that lack it
+    # Backfill zone for any pre-existing cells that lack it (kept for legacy
+    # deployments; new-layout cells always have zone set on insert).
     await db.warehouse_locations.update_many(
         {"zone": {"$exists": False}},
         [{"$set": {"zone": {"$cond": [
-            {"$and": [{"$eq": ["$rack", "D"]}, {"$eq": ["$row", 10]}]},
+            {"$and": [{"$eq": ["$rack", "C"]}, {"$eq": ["$row", ROWS_PER]}]},
             "return_holding", "main"
         ]}}}]
     )
@@ -11801,11 +11804,101 @@ async def wms_get_location(request: Request, code: str):
 
 @api.post("/warehouse/seed-locations")
 async def wms_seed(request: Request):
-    """Idempotently seed all 320 cells. Safe to call any time."""
+    """Idempotently seed all cells for the current layout. Safe to call any time."""
     u = await get_current_user(request); require_roles("admin", "manager")(u)
     inserted = await _seed_warehouse_locations()
     total = await db.warehouse_locations.count_documents({})
     return {"inserted": inserted, "total": total}
+
+
+@api.post("/warehouse/rebuild-layout")
+async def wms_rebuild_layout(request: Request):
+    """DESTRUCTIVE: drop `warehouse_locations` and reseed with the current
+    layout (10 lines × 3 racks × 8 cells @ 40 pairs = 240 cells / 9,600 pairs).
+
+    Existing `fg_location_inventory` rows are auto-migrated: each row is
+    relocated to the first available cell of the new layout, preferring cells
+    already holding the same (style, color) so per-style stock stays clustered
+    together (matches the user's "re-racking must reuse allotted rack" rule).
+
+    Returns a migration report.
+    """
+    u = await get_current_user(request); require_roles("admin")(u)
+
+    dropped = await db.warehouse_locations.count_documents({})
+    await db.warehouse_locations.delete_many({})
+    inserted = await _seed_warehouse_locations()
+
+    # Migrate fg_location_inventory to the new layout ------------------------
+    now = now_iso()
+    moved   = 0
+    skipped = 0
+    # style_id → assigned location_code (so the same style keeps landing in the
+    # same rack cell until it fills up, then the next one over).
+    style_home: dict = {}
+    # location_code → running qty already assigned in this migration pass
+    fill: dict = {}
+
+    async def _next_cell_for(style_id: str, qty_needed: int) -> Optional[str]:
+        """Find a cell that (a) is already this style's "home" if not yet full,
+        else (b) the first empty cell, honouring capacity."""
+        home = style_home.get(style_id)
+        if home and fill.get(home, 0) + qty_needed <= CAPACITY:
+            return home
+        # Otherwise pick the next empty (or partially-filled) main cell
+        async for w in db.warehouse_locations.find({"zone": "main"}).sort([("row", 1), ("rack", 1), ("column", 1)]):
+            code = w["location_code"]
+            if fill.get(code, 0) + qty_needed <= CAPACITY:
+                style_home[style_id] = code
+                return code
+        return None
+
+    cur = db.fg_location_inventory.find({}).sort([("style_id", 1), ("color", 1), ("size", 1)])
+    async for inv in cur:
+        qty = int(inv.get("qty", 0))
+        if qty <= 0:
+            await db.fg_location_inventory.delete_one({"_id": inv["_id"]})
+            continue
+        sid = str(inv.get("style_id"))
+        new_code = await _next_cell_for(sid, qty)
+        if not new_code:
+            skipped += 1
+            continue
+        # Fetch cell to enrich rack/row/col (used by picklist reports)
+        cell = await db.warehouse_locations.find_one({"location_code": new_code})
+        await db.fg_location_inventory.update_one(
+            {"_id": inv["_id"]},
+            {"$set": {
+                "location_code": new_code,
+                "rack":          cell.get("rack"),
+                "row":           cell.get("row"),
+                "column":        cell.get("column"),
+                "updated_at":    now,
+            }},
+        )
+        fill[new_code] = fill.get(new_code, 0) + qty
+        moved += 1
+
+    # Re-sync warehouse_locations counters based on new fg_location_inventory
+    for code, occ in fill.items():
+        await db.warehouse_locations.update_one(
+            {"location_code": code},
+            {"$set": {
+                "occupied_pairs":  occ,
+                "available_pairs": max(0, CAPACITY - occ),
+                "status":          _recompute_status(occ, CAPACITY),
+                "updated_at":      now,
+            }},
+        )
+    return {
+        "dropped_cells":  dropped,
+        "inserted_cells": inserted,
+        "capacity_per_cell": CAPACITY,
+        "total_capacity_pairs": CAPACITY * inserted,
+        "fg_locations_migrated": moved,
+        "fg_locations_skipped_no_room": skipped,
+        "style_home_assignments": len(style_home),
+    }
 
 
 @api.get("/warehouse/fg-locations")
@@ -12407,6 +12500,288 @@ async def pending_product_list(request: Request):
     # Sort: components available first, then by created_at
     out.sort(key=lambda x: (not x.get("components_available"), x.get("created_at", "")))
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Produce a pending cell (Online / B2B) → deduct components, add excess to
+# stock in the style's already-allotted rack, record short-production reason.
+# ─────────────────────────────────────────────────────────────────────────
+
+class ProduceCellIn(BaseModel):
+    style_id:      str
+    color:         str
+    size:          str
+    produced_qty:  int
+    reason:        Optional[str] = ""       # required when produced_qty < pending
+    use_components: bool          = True     # False = "raw material mode", no component_stock deduct
+    channel_filter: Optional[str] = None     # if set, only pending jobs from this source get consumed
+    dispatch_stage: Optional[str] = "dispatched"
+
+
+async def _find_style_home_cell(style_id: str) -> Optional[str]:
+    """Return the location_code where this style is currently stocked. If
+    multiple, return the one with the most existing qty (largest cluster) —
+    that becomes the "allotted rack" for further re-racking / excess.
+    """
+    try:
+        oid_v = ObjectId(style_id)
+    except Exception:
+        return None
+    pipeline = [
+        {"$match": {"style_id": oid_v, "qty": {"$gt": 0}}},
+        {"$group": {"_id": "$location_code", "total": {"$sum": "$qty"}}},
+        {"$sort": {"total": -1}},
+        {"$limit": 1},
+    ]
+    docs = await db.fg_location_inventory.aggregate(pipeline).to_list(1)
+    return docs[0]["_id"] if docs else None
+
+
+async def _pick_new_cell_for_style(style_id: str) -> Optional[str]:
+    """When a style has never been stocked, pick the first empty main cell."""
+    home = await _find_style_home_cell(style_id)
+    if home:
+        return home
+    async for w in db.warehouse_locations.find(
+        {"zone": "main", "status": "empty"}
+    ).sort([("row", 1), ("rack", 1), ("column", 1)]).limit(1):
+        return w["location_code"]
+    return None
+
+
+@api.post("/production/produce-cell")
+async def produce_cell(request: Request, payload: ProduceCellIn):
+    """Complete production for a specific (style, color, size) cell of the
+    pending list. Handles four cases:
+
+    1) `produced == pending` → mark all matching pending jobs as dispatched.
+    2) `produced <  pending` → mark that portion dispatched, keep the shortfall
+       on the pending list, and log a `short_production` record with reason.
+    3) `produced >  pending` → dispatch all matching jobs, add the excess to
+       fg_stock + fg_location_inventory in the style's currently-allotted rack
+       (or the first empty cell if the style has no cluster yet). This is the
+       "re-racking rule": already-allotted cells absorb further stock until
+       they're full, then spill over.
+    4) `use_components=True` AND a BOM exists for the style → deduct
+       `component_master.current_stock` for each component in proportion to
+       produced_qty and record the deduction in history.
+
+    Returns a summary payload the frontend can toast.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+
+    if payload.produced_qty <= 0:
+        raise HTTPException(400, "produced_qty must be > 0")
+
+    # Fetch pending jobs matching (style, color, size). FIFO by created_at.
+    q: dict = {
+        "style_id": ObjectId(payload.style_id),
+        "color":    payload.color,
+        "size":     payload.size,
+        "stage":    {"$ne": "dispatched"},
+    }
+    if payload.channel_filter == "online_channel":
+        q["source_type"] = "online_channel"
+    elif payload.channel_filter == "b2b_client":
+        q["source_type"] = "b2b_client"
+
+    jobs = await db.production_jobs.find(q).sort("created_at", 1).to_list(500)
+    pending_total = sum(int(j.get("quantity", 0)) - int(j.get("completed_qty", 0) or 0) for j in jobs)
+
+    style = await db.styles.find_one({"_id": ObjectId(payload.style_id)})
+    if not style:
+        raise HTTPException(404, "Style not found")
+    style_code = style.get("code", "")
+
+    produced = int(payload.produced_qty)
+    is_short = produced < pending_total
+    is_over  = produced > pending_total
+    if is_short and not (payload.reason or "").strip():
+        raise HTTPException(422, "Short production must include a reason.")
+
+    # BOM check + component deduction ---------------------------------------
+    bom_used: list[dict] = []
+    if payload.use_components:
+        bom = await db.style_component_mapping.find({
+            "style_id": ObjectId(payload.style_id), "active": {"$ne": False},
+        }).to_list(200)
+        if not bom:
+            raise HTTPException(
+                412,
+                {"code": "no_production_card",
+                 "message": "No production card (BOM) mapped for this style. "
+                            "Create one before consuming components — or set use_components=false to skip.",
+                 "style_id": payload.style_id, "style_code": style_code},
+            )
+        for b in bom:
+            per = float(b.get("quantity_per_pair", 1) or 1)
+            waste = float(b.get("wastage_percent", 0) or 0) / 100.0
+            deduct = int(round(produced * per * (1 + waste)))
+            if deduct <= 0:
+                continue
+            comp = await db.component_master.find_one({"_id": ObjectId(b["component_id"])})
+            if not comp:
+                continue
+            new_stock = int(comp.get("current_stock", 0)) - deduct
+            await db.component_master.update_one(
+                {"_id": comp["_id"]},
+                {"$set": {"current_stock": new_stock, "updated_at": now_iso()},
+                 "$push": {"history": {"event": "produce_cell", "at": now_iso(),
+                                       "by": u["email"], "style_code": style_code,
+                                       "color": payload.color, "size": payload.size,
+                                       "pairs": produced, "deducted": deduct,
+                                       "new_stock": new_stock}}},
+            )
+            bom_used.append({
+                "component_id":   str(comp["_id"]),
+                "component_code": comp.get("component_code"),
+                "component_name": comp.get("component_name"),
+                "deducted":       deduct,
+                "new_stock":      new_stock,
+            })
+
+    # Dispatch/complete the pending jobs (or the covered portion) -----------
+    remaining_to_cover = min(produced, pending_total)
+    covered_job_ids: list[str] = []
+    for j in jobs:
+        if remaining_to_cover <= 0:
+            break
+        job_pending = int(j.get("quantity", 0)) - int(j.get("completed_qty", 0) or 0)
+        take = min(job_pending, remaining_to_cover)
+        new_completed = int(j.get("completed_qty", 0) or 0) + take
+        new_stage = payload.dispatch_stage if new_completed >= int(j.get("quantity", 0)) else "packing"
+        await db.production_jobs.update_one(
+            {"_id": j["_id"]},
+            {"$set": {"completed_qty": new_completed, "stage": new_stage, "updated_at": now_iso()},
+             "$push": {"history": {"event": "produced", "at": now_iso(), "by": u["email"],
+                                   "produced_qty": take, "new_completed": new_completed,
+                                   "reason": payload.reason or ""}}},
+        )
+        covered_job_ids.append(str(j["_id"]))
+        remaining_to_cover -= take
+
+    # Short-production log
+    shortfall = pending_total - produced if is_short else 0
+    if is_short:
+        await db.short_production_log.insert_one({
+            "style_id":    payload.style_id,
+            "style_code":  style_code,
+            "color":       payload.color,
+            "size":        payload.size,
+            "pending_qty": pending_total,
+            "produced_qty": produced,
+            "shortfall":   shortfall,
+            "reason":      payload.reason or "",
+            "logged_by":   u["email"],
+            "created_at":  now_iso(),
+        })
+
+    # Over-production → excess to fg_stock + fg_location_inventory ---------
+    excess = produced - pending_total if is_over else 0
+    excess_placed_at: Optional[str] = None
+    if excess > 0:
+        home = await _pick_new_cell_for_style(payload.style_id) or "01-A-01"
+        excess_placed_at = home
+        # Book raw fg_stock (via _apply_movement so historical trail is consistent)
+        try:
+            mv = FgStockMovementIn(
+                style_id=payload.style_id, color=payload.color, size=payload.size,
+                movement_type="production_in", quantity=int(excess),
+                reference_type="produce_cell_excess", reference_id="",
+                notes=f"Excess of {excess} pairs over pending {pending_total} for {style_code}",
+            )
+            await _apply_movement(mv, u["email"], skip_location_sync=True)
+        except Exception:
+            log.exception("Excess fg_stock movement failed")
+        # Push into the style's home cell (partial fill if needed)
+        cell = await db.warehouse_locations.find_one({"location_code": home})
+        capacity = int(cell.get("capacity_pairs", CAPACITY)) if cell else CAPACITY
+        room = capacity - int(cell.get("occupied_pairs", 0)) if cell else capacity
+        put_here = min(excess, room)
+        if put_here > 0:
+            await db.fg_location_inventory.update_one(
+                {"style_id": ObjectId(payload.style_id), "color": payload.color,
+                 "size": payload.size, "location_code": home},
+                {"$inc": {"qty": put_here},
+                 "$setOnInsert": {"style_code": style_code, "created_at": now_iso(),
+                                  "rack": cell.get("rack") if cell else None,
+                                  "row":  cell.get("row")  if cell else None,
+                                  "column": cell.get("column") if cell else None},
+                 "$set": {"updated_at": now_iso()}},
+                upsert=True,
+            )
+            new_occ = int(cell.get("occupied_pairs", 0)) + put_here if cell else put_here
+            await db.warehouse_locations.update_one(
+                {"location_code": home},
+                {"$set": {"occupied_pairs":  new_occ,
+                          "available_pairs": max(0, capacity - new_occ),
+                          "status":          _recompute_status(new_occ, capacity),
+                          "updated_at":      now_iso()}},
+            )
+
+    return {
+        "ok":                  True,
+        "style_code":          style_code,
+        "color":               payload.color,
+        "size":                payload.size,
+        "pending_before":      pending_total,
+        "produced":            produced,
+        "shortfall":           shortfall,
+        "excess":              excess,
+        "excess_placed_at":    excess_placed_at,
+        "jobs_updated":        len(covered_job_ids),
+        "bom_components_used": bom_used,
+    }
+
+
+class ProductionCardIn(BaseModel):
+    style_id:   str
+    components: List[dict]  # [{component_id, quantity_per_pair, wastage_percent?}]
+
+
+@api.post("/production/production-card")
+async def create_production_card(request: Request, payload: ProductionCardIn):
+    """Bulk-upsert a style's BOM (production card). Replaces the previous
+    active mapping — deactivates old entries and inserts fresh ones. Called by
+    the "Create production card" prompt on the pending-list produce drawer
+    when a style has no BOM yet.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    sid_oid = ObjectId(payload.style_id)
+    # Deactivate previous mappings for this style
+    await db.style_component_mapping.update_many(
+        {"style_id": sid_oid, "active": {"$ne": False}},
+        {"$set": {"active": False, "updated_at": now_iso()}},
+    )
+    inserted = []
+    for c in payload.components:
+        comp_id = c.get("component_id")
+        if not comp_id:
+            continue
+        doc = {
+            "style_id":          sid_oid,
+            "component_id":      ObjectId(comp_id),
+            "quantity_per_pair": float(c.get("quantity_per_pair", 1) or 1),
+            "wastage_percent":   float(c.get("wastage_percent", 0) or 0),
+            "active":            True,
+            "created_at":        now_iso(),
+            "updated_at":        now_iso(),
+            "created_by":        u["email"],
+        }
+        r = await db.style_component_mapping.insert_one(doc)
+        inserted.append(str(r.inserted_id))
+    return {"style_id": payload.style_id, "mapping_ids": inserted, "count": len(inserted)}
+
+
+@api.get("/production/short-log")
+async def list_short_production(request: Request, style_code: Optional[str] = None):
+    """Historical short-production log — total pending list of unfulfilled qty."""
+    await get_current_user(request)
+    q: dict = {}
+    if style_code:
+        q["style_code"] = style_code
+    rows = await db.short_production_log.find(q).sort("created_at", -1).to_list(1000)
+    return [stringify(r) for r in rows]
 
 
 # ═══════════════════════════════════════════════════════════════════════
