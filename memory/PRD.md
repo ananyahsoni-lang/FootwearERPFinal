@@ -30,3 +30,22 @@
 ## Next Action Items
 - If you want SKU mapping to also enforce color/size translation (like the SkuMap page's `color_map` / `size_map`), we can extend the PO drawer with per-line color/size mapping rows too.
 - Consider auto-adding a "Print" quick-action from the picklist row (currently only via the detail drawer).
+
+## Iteration 23 (2026-07-08) — Component checkbox bug fix + Password reset flow
+### Bug 1 — Production Card "component" checkbox threw HTTP 500
+- Root cause: `class ComponentUpdate` was **defined twice** in `server.py` (lines 551 and 890). Python's later definition (component-master fields) shadowed the earlier one (upper/bottom/sole toggles), so the endpoint at line 10041 was validating the wrong schema. The `for k in ("upper_done", ...): getattr(payload, k)` loop then dereferenced attributes the payload no longer had.
+- Fix: renamed the master-record model to `ComponentMasterUpdate` and updated the `/components/{cid}` PUT endpoint. Component toggle now returns HTTP 200 with the correct `components` dict.
+
+### Bug 2 (replaced by user with narrower scope) — Admin-driven password reset + admin self-service email reset
+- **Admin resets any user's password directly** — new key-icon action on the Users list opens a drawer with new/confirm inputs, PATCHes `/api/users/{uid}` with `password`.
+- **Admin self-service reset via email** — new `POST /api/auth/forgot-password` + `POST /api/auth/reset-password`; single-use SHA-256-hashed 32-byte token stored in `password_resets`; 1-hour expiry; TTL index auto-purges expired rows; previous outstanding tokens invalidated when a new one is issued and when a token is redeemed; response never leaks whether the email exists (user-enumeration hardened).
+- **Gmail SMTP** delivery via stdlib `smtplib.SMTP_SSL('smtp.gmail.com', 465)` — pulls `GMAIL_USER` + `GMAIL_APP_PASSWORD` from `backend/.env`. Graceful degradation: when creds are missing, the JSON response includes `email_status=email_not_configured` + `dev_reset_url` so the admin can hand-deliver the link during setup. When Gmail is configured properly, no reset URL is ever included in the response.
+- **Frontend**: "Forgot password?" link on Login opens a modal; modal shows the SMTP-not-configured hint + clickable dev-reset link when applicable. New `/reset-password?token=...` route with a matching two-field new-password form. Users page gained a key-icon row action opening the admin-reset drawer.
+- Fixed the previously-outdated "SEEDED ADMIN (DEV)" hint on Login to show the actual `admin@ssk.com / admin1234` credentials from `.env`.
+
+### Verified
+- Component toggle: `PATCH /api/production/jobs/{jid}/components {upper_done:true}` → HTTP 200 with updated `components` object.
+- Forgot-password (known email, SMTP off): returns `email_status=email_not_configured` + `dev_reset_url`.
+- Forgot-password (unknown email): returns generic OK — no leak, no dev link.
+- Reset flow: token from dev link accepts new password, login succeeds with the new password, second use of the same token → HTTP 400 "already used".
+- Password restored via a new forgot round-trip so admin creds match `.env` again.

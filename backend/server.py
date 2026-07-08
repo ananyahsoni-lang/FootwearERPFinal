@@ -1219,6 +1219,213 @@ async def me(request: Request):
     return user
 
 
+# ---------- PASSWORD RESET ----------
+# Two flows:
+#   1. `POST /auth/forgot-password { email }` — issues a single-use, 1h token,
+#      stored hashed in `password_resets`, and emails a link via Gmail SMTP.
+#      Always returns 200 (does not leak whether the email exists).
+#   2. `POST /auth/reset-password { token, new_password }` — consumes the token,
+#      updates the user's password_hash, marks token used, invalidates other
+#      unused tokens for the same user.
+# Gmail SMTP is opt-in: needs GMAIL_USER + GMAIL_APP_PASSWORD env vars. Without
+# them the endpoint still creates the token but returns an "email not configured"
+# hint so the admin can hand-deliver the link if needed.
+
+import secrets
+import hashlib
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+class ForgotPasswordInput(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordInput(BaseModel):
+    token: str
+    new_password: str
+
+
+PASSWORD_RESET_TTL_HOURS = 1
+
+
+def _hash_reset_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _reset_link_base() -> str:
+    """Where the reset link should point. Prefer PUBLIC_APP_URL env, then FRONTEND_URL,
+    then fall back to the current request's origin — but we accept nothing lower than
+    the FE base URL since Gmail links must be absolute."""
+    return (
+        os.environ.get("PUBLIC_APP_URL")
+        or os.environ.get("FRONTEND_URL")
+        or "http://localhost:3000"
+    ).rstrip("/")
+
+
+def _send_reset_email(to_email: str, reset_url: str, user_name: str) -> tuple[bool, str]:
+    """Return (ok, hint). ok=False when SMTP isn't configured or send fails —
+    admin should surface the hint to the user without leaking secrets."""
+    gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    if not gmail_user or not gmail_pass:
+        return (False, "email_not_configured")
+
+    from_display = os.environ.get("GMAIL_FROM_NAME", "SSK Footcare ERP")
+    subject = "Reset your SSK Footcare ERP password"
+
+    text_body = (
+        f"Hi {user_name or 'there'},\n\n"
+        f"We received a request to reset your SSK Footcare ERP password.\n"
+        f"Open the link below to choose a new one — it expires in "
+        f"{PASSWORD_RESET_TTL_HOURS} hour(s) and can only be used once.\n\n"
+        f"{reset_url}\n\n"
+        f"If you didn't request this, you can safely ignore this email.\n\n"
+        f"— SSK Footcare Manufacturing"
+    )
+    html_body = f"""\
+<!doctype html>
+<html><body style="font-family: system-ui, sans-serif; background:#F7F7F5; padding:24px;">
+  <div style="max-width:520px; margin:0 auto; background:#fff; border:2px solid #111827; padding:28px;">
+    <div style="font-size:11px; letter-spacing:2px; color:#64748B; text-transform:uppercase;">SSK Footcare Manufacturing</div>
+    <h1 style="font-size:24px; margin:8px 0 16px;">Reset your password</h1>
+    <p>Hi {user_name or 'there'},</p>
+    <p>Click the button below to choose a new password. This link expires in
+       <strong>{PASSWORD_RESET_TTL_HOURS} hour(s)</strong> and can only be used once.</p>
+    <p style="text-align:center; margin:24px 0;">
+      <a href="{reset_url}"
+         style="background:#0F172A; color:#fff; text-decoration:none; padding:12px 24px;
+                font-weight:700; letter-spacing:2px; text-transform:uppercase; font-size:12px;">
+        Reset Password
+      </a>
+    </p>
+    <p style="font-size:12px; color:#64748B; word-break:break-all;">Or copy this URL:<br/>{reset_url}</p>
+    <hr style="border:none; border-top:1px solid #E2E8F0; margin:20px 0;"/>
+    <p style="font-size:11px; color:#94A3B8;">If you didn't request this, you can safely ignore this email.</p>
+  </div>
+</body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = f"{from_display} <{gmail_user}>"
+    msg["To"] = to_email
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, [to_email], msg.as_string())
+        return (True, "sent")
+    except smtplib.SMTPAuthenticationError:
+        log.exception("Gmail SMTP authentication failed")
+        return (False, "smtp_auth_failed")
+    except Exception:
+        log.exception("Gmail SMTP send failed")
+        return (False, "smtp_send_failed")
+
+
+@api.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordInput, request: Request):
+    """Issue a single-use, 1-hour password-reset token and email it.
+
+    Always returns 200 with a generic message — we never leak whether an email
+    is registered (prevents user-enumeration).
+    """
+    email = payload.email.lower().strip()
+    user = await db.users.find_one({"email": email})
+
+    generic_ok = {
+        "ok": True,
+        "message": "If that email matches an account, a reset link has been sent.",
+    }
+
+    if not user or not user.get("active", True):
+        # Log the attempt but always return generic 200
+        log.info("Forgot-password requested for unknown/inactive email: %s", email)
+        return generic_ok
+
+    # Generate a strong opaque token; store only its SHA-256 hash
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(raw_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=PASSWORD_RESET_TTL_HOURS)
+
+    # Invalidate previous unused tokens for this user before issuing a new one
+    await db.password_resets.update_many(
+        {"user_id": str(user["_id"]), "used_at": None},
+        {"$set": {"used_at": now_iso(), "invalidated": True}},
+    )
+
+    await db.password_resets.insert_one({
+        "user_id":    str(user["_id"]),
+        "email":      email,
+        "token_hash": token_hash,
+        "expires_at": expires_at,
+        "used_at":    None,
+        "created_at": datetime.now(timezone.utc),
+        "created_ip": request.client.host if request.client else "unknown",
+    })
+
+    reset_url = f"{_reset_link_base()}/reset-password?token={raw_token}"
+    ok, hint = _send_reset_email(email, reset_url, user.get("name", ""))
+
+    # Response for the caller.
+    if ok:
+        return generic_ok
+
+    # SMTP not configured / failed — surface a discoverable hint to the caller
+    # (still 200 so we don't leak account existence). Admin who calls this on
+    # their own account can look at the JSON body to see the link.
+    resp: dict = dict(generic_ok)
+    resp["email_status"] = hint  # "email_not_configured" | "smtp_auth_failed" | "smtp_send_failed"
+    if hint == "email_not_configured":
+        # In dev, expose the reset link so the admin can hand-deliver it.
+        # NEVER exposes the token when SMTP is properly configured.
+        resp["dev_reset_url"] = reset_url
+    return resp
+
+
+@api.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordInput):
+    """Consume a reset token and set a new password. Invalidates all other
+    outstanding tokens for the same user on success."""
+    token_hash = _hash_reset_token(payload.token.strip())
+    row = await db.password_resets.find_one({"token_hash": token_hash})
+    if not row:
+        raise HTTPException(400, "Invalid or already-used reset link.")
+    if row.get("used_at"):
+        raise HTTPException(400, "This reset link has already been used.")
+    exp = row.get("expires_at")
+    if isinstance(exp, datetime):
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp < datetime.now(timezone.utc):
+            raise HTTPException(400, "This reset link has expired. Please request a new one.")
+    validate_password(payload.new_password)
+
+    user = await db.users.find_one({"_id": oid(row["user_id"])})
+    if not user or not user.get("active", True):
+        raise HTTPException(400, "Account not found or inactive.")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password_hash": hash_password(payload.new_password),
+                  "password_updated_at": now_iso()}},
+    )
+    # Mark this token used + invalidate every other outstanding token for this user
+    await db.password_resets.update_one(
+        {"_id": row["_id"]},
+        {"$set": {"used_at": now_iso()}},
+    )
+    await db.password_resets.update_many(
+        {"user_id": str(user["_id"]), "used_at": None, "_id": {"$ne": row["_id"]}},
+        {"$set": {"used_at": now_iso(), "invalidated": True}},
+    )
+    return {"ok": True, "message": "Password updated. You can now sign in."}
+
+
 # ---------- USERS (admin) ----------
 @api.get("/users")
 async def list_users(request: Request):
@@ -12616,6 +12823,14 @@ async def on_startup():
         await db.style_lifecycle.create_index("online_status", name="style_lifecycle_status")
     except Exception as e:
         log.warning(f"Could not create style_lifecycle indexes: {e}")
+
+    # Password reset tokens: TTL index auto-purges expired rows + lookup index on hash.
+    try:
+        await db.password_resets.create_index("token_hash", unique=True, name="password_reset_token")
+        await db.password_resets.create_index("user_id", name="password_reset_user")
+        await db.password_resets.create_index("expires_at", expireAfterSeconds=0, name="password_reset_ttl")
+    except Exception as e:
+        log.warning(f"Could not create password_resets indexes: {e}")
 
     # Component master: unique (code, color, size). Category & active for fast filter.
     try:

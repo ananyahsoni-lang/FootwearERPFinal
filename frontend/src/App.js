@@ -34,6 +34,7 @@ import PendingProductList from "@/pages/PendingProductList";
 import ListingFormats from "@/pages/ListingFormats";
 import OrderImportFormats from "@/pages/OrderImportFormats";
 import SelectWorkspace from "@/pages/SelectWorkspace";
+import ResetPassword from "@/pages/ResetPassword";
 import { Loader2 } from "lucide-react";
 
 function Protected({ children }) {
@@ -62,6 +63,7 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
+          <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/select-workspace" element={<Protected><SelectWorkspace /></Protected>} />
           <Route path="/" element={<Protected><AppShell /></Protected>}>
 
