@@ -12784,6 +12784,45 @@ async def list_short_production(request: Request, style_code: Optional[str] = No
     return [stringify(r) for r in rows]
 
 
+@api.get("/production/style-variants/{sid}")
+async def style_variants(sid: str, request: Request):
+    """Return every (color, size) pair we've ever seen for this style — used by
+    the Online Production Floor ad-hoc drawer to pre-fill its color × size
+    matrix. Sources: fg_location_inventory (physical stock), production_jobs
+    (in-flight), style_lifecycle.planned_{colors,sizes} (aspirational), and
+    style.base_size.
+    """
+    await get_current_user(request)
+    try:
+        sid_oid = ObjectId(sid)
+    except Exception:
+        raise HTTPException(400, "Invalid style_id")
+
+    colors, sizes = set(), set()
+    async for r in db.fg_location_inventory.find({"style_id": sid_oid}, {"color": 1, "size": 1}):
+        if r.get("color"): colors.add(str(r["color"]))
+        if r.get("size"):  sizes.add(str(r["size"]))
+    async for r in db.production_jobs.find({"style_id": sid_oid}, {"color": 1, "size": 1}):
+        if r.get("color"): colors.add(str(r["color"]))
+        if r.get("size"):  sizes.add(str(r["size"]))
+    lc = await db.style_lifecycle.find_one({"style_id": sid})
+    if lc:
+        for c in (lc.get("planned_colors") or []):
+            if c: colors.add(str(c))
+        for s in (lc.get("planned_sizes")  or []):
+            if s: sizes.add(str(s))
+
+    def _sortsz(s):
+        try: return (0, float(s))
+        except (ValueError, TypeError):
+            return (1, s)
+
+    return {
+        "colors": sorted(colors),
+        "sizes":  sorted(sizes, key=_sortsz),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ══ MARKETPLACE SKU RESOLVER ENGINE ════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════

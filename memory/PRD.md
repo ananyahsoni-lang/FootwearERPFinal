@@ -134,3 +134,20 @@ python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 - Screenshots confirm floor renders correctly with product images and state-appropriate buttons.
 - BOM drawer opens for SSK_00001, shows its UPP-TAN-01 mapping with editable qty/waste/active toggle + add-new row.
 - Zero backend changes needed — reuses `/style-component-mapping` (already had list/create/update/delete) and `/production/produce-cell` (already had all four modes).
+
+## Iteration 28 (2026-07-08) — Ad-hoc production Color × Size matrix + Richer demo BOMs
+### Matrix on Online Production Floor
+- `AdHocProduceDrawer` rewritten from single (color, size, qty) inputs to a **Color × Size matrix** — same visual language as the Production Card + Pending List.
+- New backend endpoint `GET /api/production/style-variants/{style_id}` returns every color+size we've ever seen for the style (from `fg_location_inventory`, `production_jobs`, `style_lifecycle.planned_*`). The frontend pre-populates the matrix rows/cols from this so operators skip manual data entry.
+- Users can still add colors/sizes on the fly (Enter or Add button) and remove them with the small × on chip headers.
+- Row/column/grand totals update live; filled cells highlight in emerald with bold text.
+- Submit fires **one** `/production/produce-cell` per non-zero cell **sequentially** — a single cell error (e.g. shortfall-needs-reason) doesn't abort the batch; the result panel lists successes and failures separately with per-cell component-deduction traces.
+
+### Richer demo BOMs
+- `seed_demo.py` gained `seed_components_and_boms()` — creates 8 component_master rows (3 color-specific Uppers + Sole + Insole + Box + Poly Bag + Brand Tag) with realistic stock levels + reorder points, and 18 `style_component_mapping` rows (6 per style × 3 demo styles). Every demo style now has a full BOM that auto-deducts on every production run.
+- Idempotent: components keyed by `component_code`; BOM mappings dedup by (style_id, component_id).
+
+### Verified
+- Style-variants endpoint returned `["Brown","Tan"] × ["7","8","9"]` for SSK_00001 — matches seeded inventory.
+- Matrix flow: filled Tan/7=5, Tan/8=3, Brown/9=2 → clicked "Produce 10 pairs" → 2 cells produced (7 pairs placed at `01-A-01`, deductions across 8 components), 1 cell surfaced a shortfall-reason error. Grand total pill correctly showed 10 in the header button.
+- Seeder final counts: 8 components, 18 BOM rows, 3 demo styles with production cards ready.

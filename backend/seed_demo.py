@@ -255,6 +255,94 @@ async def seed_online_orders(db, styles):
     print(f"  online_orders seeded: {len(orders)}")
 
 
+async def seed_components_and_boms(db, styles):
+    """Populate `component_master` and `style_component_mapping` (BOM) for the
+    demo styles so the Production Floor + BOM editor have realistic examples.
+    Idempotent: rows are keyed on `component_code`."""
+    now = now_iso()
+    # Baseline component palette — mimics a real footwear BOM
+    palette = [
+        # (code,          name,                 category, color,  unit,  stock, reorder)
+        ("DEMO-UPP-TAN",  "Tan PU Upper",       "Upper",  "Tan",   "pair", 120, 20),
+        ("DEMO-UPP-BLK",  "Black PU Upper",     "Upper",  "Black", "pair",  90, 20),
+        ("DEMO-UPP-BEG",  "Beige Suede Upper",  "Upper",  "Beige", "pair",  80, 20),
+        ("DEMO-SOL-EVA",  "EVA Bottom Sole",    "Sole",   "",      "pair", 200, 30),
+        ("DEMO-INS-MEM",  "Memory Foam Insole", "Insole", "",      "pair", 250, 30),
+        ("DEMO-BOX-STD",  "Standard Shoe Box",  "Box",    "",      "pcs",  400, 50),
+        ("DEMO-BAG-POLY", "Poly Bag",           "Packaging","",    "pcs",  600, 80),
+        ("DEMO-TAG-BRAND","Brand Tag",          "Tag",    "",      "pcs",  500, 60),
+    ]
+    comp_by_code = {}
+    for (code, name, cat, color, unit, stock, reorder) in palette:
+        existing = await db.component_master.find_one({"component_code": code})
+        if existing:
+            comp_by_code[code] = existing["_id"]
+            continue
+        doc = {
+            "component_code":     code,
+            "component_name":     name,
+            "component_category": cat,
+            "color":              color or None,
+            "unit":               unit,
+            "current_stock":      stock,
+            "reserved_stock":     0,
+            "reorder_level":      reorder,
+            "minimum_stock":      max(5, reorder // 2),
+            "vendor":             "",
+            "active":             True,
+            "created_at":         now,
+            "updated_at":         now,
+            "demo_tag":           DEMO_TAG,
+        }
+        r = await db.component_master.insert_one(doc)
+        comp_by_code[code] = r.inserted_id
+    print(f"  component_master rows ready: {len(comp_by_code)}")
+
+    # BOM per style — every style consumes Sole + Insole + Box + Poly + Tag,
+    # plus the color-appropriate Upper. Realistic quantities-per-pair.
+    s0, s1, s2 = styles[0], styles[1 % len(styles)], styles[2 % len(styles)]
+    bom_plan = [
+        # (style, upper_code)
+        (s0, "DEMO-UPP-TAN"),
+        (s1, "DEMO-UPP-BLK"),
+        (s2, "DEMO-UPP-BEG"),
+    ]
+    common = [
+        ("DEMO-SOL-EVA",  1.0, 3.0),
+        ("DEMO-INS-MEM",  1.0, 2.0),
+        ("DEMO-BOX-STD",  1.0, 1.0),
+        ("DEMO-BAG-POLY", 1.0, 0.5),
+        ("DEMO-TAG-BRAND", 2.0, 0.5),
+    ]
+    inserted, skipped = 0, 0
+    for style, upper_code in bom_plan:
+        style_oid, style_code, *_ = style
+        rows = [("upper", upper_code, 1.0, 5.0)] + [("", c, q, w) for (c, q, w) in common]
+        for (_label, ccode, qty, waste) in rows:
+            cid = comp_by_code.get(ccode)
+            if not cid:
+                continue
+            already = await db.style_component_mapping.find_one({"style_id": style_oid, "component_id": cid})
+            if already:
+                skipped += 1
+                continue
+            comp = await db.component_master.find_one({"_id": cid})
+            await db.style_component_mapping.insert_one({
+                "style_id":           style_oid,
+                "component_id":       cid,
+                "component_category": (comp or {}).get("component_category", ""),
+                "quantity_per_pair":  float(qty),
+                "wastage_percent":    float(waste),
+                "active":             True,
+                "created_at":         now,
+                "updated_at":         now,
+                "created_by":         "demo@ssk.com",
+                "demo_tag":           DEMO_TAG,
+            })
+            inserted += 1
+    print(f"  style_component_mapping rows: inserted={inserted}, already-there skipped={skipped}")
+
+
 async def seed_picklists(db, styles):
     """Create picklists directly — small, self-contained, image-enriched.
 
@@ -353,6 +441,7 @@ async def main(reset: bool):
                            "Create/import styles first (or run the styles bulk-import template).")
 
     print(f"Using demo styles: {[s[1] for s in styles]}")
+    await seed_components_and_boms(db, styles)
     await seed_fg_inventory(db, styles)
     await seed_production_jobs(db, styles)
     await seed_online_orders(db, styles)

@@ -207,53 +207,119 @@ export default function OnlineProductionFloor() {
 
 
 /* ────────────────────────────────────────────────────────────
-   AdHocProduceDrawer — produce N pairs of (color, size) for a
-   style without any pending order (online floor). Any excess
-   over pending jobs (usually all) lands in stock via the same
-   /production/produce-cell endpoint.
-   ──────────────────────────────────────────────────────────── */
+   AdHocProduceDrawer — color × size matrix. Operators can produce
+   many (color, size) combinations for one style in a single pass —
+   mirroring the Production Card + Pending List layout. Each non-zero
+   cell → one POST /production/produce-cell call. Result summary
+   surfaces per-cell success/error.
+   ──────────────────────────────────────────────────────────────── */
 function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
-  const [color, setColor]           = useState("");
-  const [size, setSize]             = useState("");
-  const [qty, setQty]               = useState(10);
+  const [colors, setColors]     = useState([]);
+  const [sizes, setSizes]       = useState([]);
+  const [qty, setQty]           = useState({});         // key `${c}||${s}` → number
+  const [newColor, setNewColor] = useState("");
+  const [newSize, setNewSize]   = useState("");
   const [useComponents, setUseComp] = useState(hasBom);
-  const [busy, setBusy]             = useState(false);
-  const [err, setErr]               = useState("");
-  const [result, setResult]         = useState(null);
+  const [busy, setBusy]         = useState(false);
+  const [err, setErr]           = useState("");
+  const [results, setResults]   = useState(null);  // {ok:[], errors:[]}
+
+  // Prefill the matrix from any variants this style has been produced/stored in.
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await http.get(`/production/style-variants/${style.id}`);
+        setColors(r.data?.colors?.length ? r.data.colors : []);
+        setSizes(r.data?.sizes?.length   ? r.data.sizes   : []);
+      } catch {
+        setColors([]); setSizes([]);
+      }
+    })();
+  }, [style.id]);
+
+  const cellKey = (c, s) => `${c}||${s}`;
+  const setCell = (c, s, v) =>
+    setQty((prev) => ({ ...prev, [cellKey(c, s)]: Math.max(0, Number(v) || 0) }));
+  const cellVal = (c, s) => Number(qty[cellKey(c, s)] || 0);
+
+  const rowTotal = (c) => sizes.reduce((sum, s) => sum + cellVal(c, s), 0);
+  const colTotal = (s) => colors.reduce((sum, c) => sum + cellVal(c, s), 0);
+  const grandTotal = colors.reduce((sum, c) => sum + rowTotal(c), 0);
+
+  const addColor = () => {
+    const v = newColor.trim();
+    if (!v || colors.includes(v)) return;
+    setColors((p) => [...p, v]);
+    setNewColor("");
+  };
+  const addSize = () => {
+    const v = newSize.trim();
+    if (!v || sizes.includes(v)) return;
+    setSizes((p) => [...p, v]);
+    setNewSize("");
+  };
+  const removeColor = (c) => {
+    setColors((p) => p.filter((x) => x !== c));
+    setQty((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((k) => k.startsWith(`${c}||`) && delete next[k]);
+      return next;
+    });
+  };
+  const removeSize = (s) => {
+    setSizes((p) => p.filter((x) => x !== s));
+    setQty((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((k) => k.endsWith(`||${s}`) && delete next[k]);
+      return next;
+    });
+  };
 
   const submit = async () => {
-    setErr(""); setResult(null); setBusy(true);
-    try {
-      if (!color.trim() || !size.trim()) {
-        setErr("Color and Size are both required."); setBusy(false); return;
+    setErr(""); setResults(null); setBusy(true);
+    // Build the list of non-zero cells
+    const cells = [];
+    for (const c of colors) for (const s of sizes) {
+      const v = cellVal(c, s);
+      if (v > 0) cells.push({ color: c, size: String(s), qty: v });
+    }
+    if (cells.length === 0) {
+      setErr("Enter at least one non-zero cell to produce.");
+      setBusy(false);
+      return;
+    }
+    // Fire produce-cell for each cell sequentially — one failing cell (e.g.
+    // "no production card") shouldn't stop the whole batch.
+    const ok = [], errors = [];
+    for (const cell of cells) {
+      try {
+        const { data } = await http.post("/production/produce-cell", {
+          style_id:       style.id,
+          color:          cell.color,
+          size:           cell.size,
+          produced_qty:   cell.qty,
+          use_components: useComponents,
+          channel_filter: "online_channel",
+        });
+        ok.push({ ...cell, ...data });
+      } catch (e) {
+        const d = e.response?.data?.detail;
+        const msg = (d && typeof d === "object" && d.message) ? d.message : friendlyAxiosError(e);
+        errors.push({ ...cell, error: msg });
       }
-      const { data } = await http.post("/production/produce-cell", {
-        style_id:       style.id,
-        color:          color.trim(),
-        size:           String(size).trim(),
-        produced_qty:   Number(qty),
-        use_components: useComponents,
-        channel_filter: "online_channel",
-      });
-      setResult(data);
-    } catch (e) {
-      const detail = e.response?.data?.detail;
-      if (detail && typeof detail === "object" && detail.code === "no_production_card") {
-        setErr("This style has no Production Card yet. Click 'Edit Production Card' below to add components, or turn off 'Deduct from Component Inventory' to produce from raw material.");
-      } else {
-        setErr(friendlyAxiosError(e));
-      }
-    } finally { setBusy(false); }
+    }
+    setResults({ ok, errors });
+    setBusy(false);
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-2 sm:p-4 overflow-y-auto" onClick={onClose}>
       <div
-        className="bg-white w-full sm:max-w-md border-2 border-slate-900 shadow-ind-lg"
+        className="bg-white w-full max-w-4xl border-2 border-slate-900 shadow-ind-lg my-4"
         onClick={(e) => e.stopPropagation()}
         data-testid="adhoc-produce-drawer"
       >
-        <div className="px-5 py-4 border-b-2 border-slate-900 bg-slate-50 flex items-center justify-between gap-3">
+        <div className="px-5 py-4 border-b-2 border-slate-900 bg-slate-50 flex items-center justify-between gap-3 sticky top-0 z-10">
           <div className="flex items-center gap-3 min-w-0">
             <SafeImage
               image={{ url: style.image_url, display_url: style.image_display_url, thumbnail_url: style.image_thumbnail_url }}
@@ -262,7 +328,7 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
               className="w-12 h-12 flex-shrink-0"
             />
             <div className="min-w-0">
-              <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Ad-hoc Production</div>
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Ad-hoc Production — Color × Size Matrix</div>
               <div className="font-mono font-black">{style.code}</div>
               <div className="text-xs text-slate-500 truncate">{style.name}</div>
             </div>
@@ -270,42 +336,126 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
           <button onClick={onClose} className="text-slate-500 hover:text-slate-900" data-testid="adhoc-close"><X className="w-5 h-5" /></button>
         </div>
 
-        {result ? (
+        {results ? (
           <div className="p-5 space-y-3">
-            <div className="p-3 border-2 border-emerald-500 bg-emerald-50 text-emerald-900 text-xs">
-              <div className="font-bold">Recorded</div>
-              <div className="mt-1 space-y-0.5">
-                <div>Produced <strong>{result.produced}</strong> pairs.</div>
-                {result.pending_before > 0
-                  ? <div>Consumed <strong>{result.pending_before}</strong> from pending orders.</div>
-                  : <div>No pending orders matched — all pairs added directly to stock.</div>}
-                {result.excess > 0 && <div>Excess of <strong>{result.excess}</strong> pairs placed at <strong className="font-mono">{result.excess_placed_at}</strong>.</div>}
-                {result.bom_components_used?.length > 0 && (
-                  <div>Components: {result.bom_components_used.map((c) => `${c.component_code} (-${c.deducted}, ${c.new_stock} left)`).join(", ")}</div>
-                )}
+            {results.ok.length > 0 && (
+              <div className="p-3 border-2 border-emerald-500 bg-emerald-50 text-emerald-900 text-xs">
+                <div className="font-bold mb-1">Produced {results.ok.reduce((s, r) => s + r.qty, 0)} pairs across {results.ok.length} cell(s):</div>
+                <ul className="space-y-0.5">
+                  {results.ok.map((r, i) => (
+                    <li key={i}>
+                      <span className="font-mono">{r.color} · Size {r.size}</span> — {r.qty} pairs
+                      {r.excess_placed_at && <> · placed at <span className="font-mono">{r.excess_placed_at}</span></>}
+                      {r.bom_components_used?.length > 0 && (
+                        <> · deducted: {r.bom_components_used.map(c => `${c.component_code} (−${c.deducted})`).join(", ")}</>
+                      )}
+                    </li>
+                  ))}
+                </ul>
               </div>
-            </div>
-            <div className="flex justify-end">
+            )}
+            {results.errors.length > 0 && (
+              <div className="p-3 border-2 border-red-400 bg-red-50 text-red-900 text-xs">
+                <div className="font-bold mb-1">{results.errors.length} cell(s) failed:</div>
+                <ul className="space-y-0.5">
+                  {results.errors.map((r, i) => (
+                    <li key={i}><span className="font-mono">{r.color} · Size {r.size}</span> — {r.error}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <BtnSecondary onClick={() => { setResults(null); setQty({}); }}>Produce more</BtnSecondary>
               <BtnPrimary onClick={onDone} data-testid="adhoc-done">Done</BtnPrimary>
             </div>
           </div>
         ) : (
-          <div className="p-5 space-y-3">
-            <div>
-              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Color</label>
-              <input value={color} onChange={(e) => setColor(e.target.value)} placeholder="e.g. Tan" className="w-full mt-0.5 border-2 border-slate-300 px-3 py-2 text-sm" data-testid="adhoc-color" />
-            </div>
-            <div>
-              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Size</label>
-              <input value={size} onChange={(e) => setSize(e.target.value)} placeholder="e.g. 7" className="w-full mt-0.5 border-2 border-slate-300 px-3 py-2 text-sm font-mono" data-testid="adhoc-size" />
-            </div>
+          <div className="p-5 space-y-4">
+            {(colors.length === 0 || sizes.length === 0) && (
+              <div className="p-2 border-2 border-amber-300 bg-amber-50 text-amber-900 text-xs">
+                Add at least one color and one size below to build the matrix.
+              </div>
+            )}
 
-            <div className="text-center pt-1">
-              <div className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-1">Pairs to produce</div>
-              <div className="flex items-center justify-center gap-2">
-                <button onClick={() => setQty(Math.max(1, Number(qty) - 1))} className="w-10 h-10 border-2 border-slate-300 hover:border-slate-900 text-lg font-bold">−</button>
-                <input type="number" value={qty} onChange={(e) => setQty(Math.max(0, Number(e.target.value)))} className="w-24 border-2 border-slate-300 px-2 py-2 text-center font-mono font-black text-2xl" data-testid="adhoc-qty" />
-                <button onClick={() => setQty(Number(qty) + 1)} className="w-10 h-10 border-2 border-slate-300 hover:border-slate-900 text-lg font-bold">+</button>
+            {/* Matrix table */}
+            {colors.length > 0 && sizes.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="text-xs border-collapse">
+                  <thead>
+                    <tr>
+                      <th className="border border-slate-300 bg-slate-100 px-2 py-1 sticky left-0 z-10">Color \ Size</th>
+                      {sizes.map((s) => (
+                        <th key={s} className="border border-slate-300 bg-slate-50 px-1 py-1 font-mono min-w-[3.5rem]">
+                          {s}
+                          <button onClick={() => removeSize(s)} className="ml-1 text-slate-400 hover:text-red-600 align-super" title={`Remove size ${s}`}>×</button>
+                        </th>
+                      ))}
+                      <th className="border border-slate-300 bg-slate-200 px-2 py-1">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {colors.map((c) => (
+                      <tr key={c}>
+                        <th className="border border-slate-300 bg-slate-50 px-2 py-1 text-left sticky left-0 z-10 font-mono">
+                          {c}
+                          <button onClick={() => removeColor(c)} className="ml-1 text-slate-400 hover:text-red-600 align-super" title={`Remove color ${c}`}>×</button>
+                        </th>
+                        {sizes.map((s) => (
+                          <td key={s} className="border border-slate-300 p-0">
+                            <input
+                              type="number"
+                              min="0"
+                              value={qty[cellKey(c, s)] || ""}
+                              onChange={(e) => setCell(c, s, e.target.value)}
+                              className={`w-16 text-center font-mono py-1.5 focus:outline-none focus:bg-emerald-50 ${cellVal(c, s) > 0 ? "bg-emerald-50 font-bold" : "bg-white"}`}
+                              data-testid={`matrix-cell-${c}-${s}`}
+                            />
+                          </td>
+                        ))}
+                        <td className="border border-slate-300 bg-slate-100 px-2 py-1.5 text-center font-mono font-bold">{rowTotal(c) || "·"}</td>
+                      </tr>
+                    ))}
+                    <tr>
+                      <th className="border border-slate-300 bg-slate-200 px-2 py-1 text-left sticky left-0 z-10 uppercase text-[10px]">Total</th>
+                      {sizes.map((s) => (
+                        <td key={s} className="border border-slate-300 bg-slate-100 px-1 py-1.5 text-center font-mono font-bold">{colTotal(s) || "·"}</td>
+                      ))}
+                      <td className="border border-slate-300 bg-slate-900 text-white px-2 py-1.5 text-center font-mono font-black text-base" data-testid="matrix-grand-total">{grandTotal}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Add color / size chips */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Add color</label>
+                <div className="flex gap-1 mt-0.5">
+                  <input
+                    value={newColor}
+                    onChange={(e) => setNewColor(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && addColor()}
+                    placeholder="e.g. Tan"
+                    className="flex-1 border-2 border-slate-300 px-2 py-1.5 text-sm"
+                    data-testid="adhoc-new-color"
+                  />
+                  <BtnSecondary onClick={addColor} data-testid="adhoc-add-color">Add</BtnSecondary>
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Add size</label>
+                <div className="flex gap-1 mt-0.5">
+                  <input
+                    value={newSize}
+                    onChange={(e) => setNewSize(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && addSize()}
+                    placeholder="e.g. 7"
+                    className="flex-1 border-2 border-slate-300 px-2 py-1.5 text-sm font-mono"
+                    data-testid="adhoc-new-size"
+                  />
+                  <BtnSecondary onClick={addSize} data-testid="adhoc-add-size">Add</BtnSecondary>
+                </div>
               </div>
             </div>
 
@@ -321,16 +471,15 @@ function AdHocProduceDrawer({ style, hasBom, onClose, onEditBom, onDone }) {
             </label>
 
             {err && (
-              <div className="p-2 border-2 border-red-300 bg-red-50 text-red-900 text-xs" data-testid="adhoc-error">
-                {err}
-              </div>
+              <div className="p-2 border-2 border-red-300 bg-red-50 text-red-900 text-xs" data-testid="adhoc-error">{err}</div>
             )}
 
             <div className="flex gap-2 pt-1">
               <BtnSecondary onClick={onEditBom} className="flex-1"><Wrench className="w-3.5 h-3.5 inline mr-1" />Edit Production Card</BtnSecondary>
-              <BtnPrimary onClick={submit} disabled={busy || qty <= 0} className="flex-1" data-testid="adhoc-submit">
+              <BtnPrimary onClick={submit} disabled={busy || grandTotal <= 0} className="flex-1" data-testid="adhoc-submit">
                 {busy && <Loader2 className="w-3.5 h-3.5 inline mr-1 animate-spin" />}
-                <Package className="w-3.5 h-3.5 inline mr-1" />Produce
+                <Package className="w-3.5 h-3.5 inline mr-1" />
+                Produce {grandTotal > 0 ? `${grandTotal} pairs` : ""}
               </BtnPrimary>
             </div>
           </div>
