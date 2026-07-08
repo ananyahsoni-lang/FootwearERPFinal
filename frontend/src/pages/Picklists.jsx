@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { http, friendlyAxiosError } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
+import { SafeImage } from "../components/ImageUploader";
 import { QRCodeSVG } from "qrcode.react";
 import { RefreshCw, ClipboardList, X, Printer, ScanLine, CheckCircle2, Trash2, Zap, ZapOff } from "lucide-react";
 
@@ -260,6 +261,46 @@ function PicklistDrawer({ id, onClose, onChanged }) {
     [pl]
   );
 
+  // Group items by (style_code, color) → { sizes: { size: {qty, locations:[]} }, total, image }
+  const matrix = useMemo(() => {
+    if (!pl) return [];
+    const groups = {};
+    for (const it of pl.items) {
+      const key = `${it.style_code}||${it.color || "—"}`;
+      if (!groups[key]) {
+        groups[key] = {
+          style_code:           it.style_code,
+          style_name:           it.style_name || "",
+          color:                it.color || "—",
+          image_url:            it.image_url || "",
+          image_display_url:    it.image_display_url || "",
+          image_thumbnail_url:  it.image_thumbnail_url || "",
+          sizes:                {},
+          total:                0,
+        };
+      }
+      const g = groups[key];
+      const sz = String(it.size || "—");
+      if (!g.sizes[sz]) g.sizes[sz] = { qty: 0, locations: [] };
+      g.sizes[sz].qty += Number(it.qty || 0);
+      g.sizes[sz].locations.push(it.location_code);
+      g.total += Number(it.qty || 0);
+    }
+    // Collect unique sizes across all groups, numeric-sort
+    const rows = Object.values(groups).sort((a, b) =>
+      (a.style_code || "").localeCompare(b.style_code || "") ||
+      (a.color || "").localeCompare(b.color || "")
+    );
+    const allSizesSet = new Set();
+    rows.forEach(r => Object.keys(r.sizes).forEach(s => allSizesSet.add(s)));
+    const allSizes = [...allSizesSet].sort((a, b) => {
+      const na = parseFloat(a), nb = parseFloat(b);
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      return String(a).localeCompare(String(b));
+    });
+    return { rows, allSizes };
+  }, [pl]);
+
   const pickedCount = pl ? pl.items.filter(i => i.picked).length : 0;
   const totalCount  = pl ? pl.items.length : 0;
   const progressPct = totalCount ? Math.round(pickedCount / totalCount * 100) : 0;
@@ -398,13 +439,27 @@ function PicklistDrawer({ id, onClose, onChanged }) {
                     return (
                       <div key={idx} className={`border-b border-slate-200 last:border-b-0 ${it.picked ? "bg-green-50" : isNext ? "bg-emerald-50 border-l-4 border-l-emerald-500" : ""}`}>
                         <div className="px-4 py-3 flex items-center gap-4">
-                          <div className="flex-shrink-0 flex flex-col items-center">
-                            <QRCodeSVG value={it.location_code} size={72} />
-                            <div className="text-[10px] font-mono font-bold mt-1">{it.location_code}</div>
+                          <div className="flex-shrink-0">
+                            <SafeImage
+                              image={{
+                                url: it.image_url,
+                                display_url: it.image_display_url,
+                                thumbnail_url: it.image_thumbnail_url,
+                              }}
+                              alt={it.style_code}
+                              aspectRatio="1/1"
+                              className="w-16 h-16"
+                            />
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="font-bold font-mono">{it.style_code} · {it.color} · Size {it.size}</div>
-                            <div className="text-xs text-slate-500 mt-0.5">Rack {it.rack} · Row {it.row} · Col {it.column}</div>
+                            {it.style_name && (
+                              <div className="text-[11px] text-slate-500 truncate">{it.style_name}</div>
+                            )}
+                            <div className="text-xs text-slate-500 mt-0.5 font-mono">
+                              Loc <span className="bg-slate-100 px-1.5 py-0.5 border border-slate-300">{it.location_code}</span>
+                              <span className="ml-2">Rack {it.rack} · Row {it.row} · Col {it.column}</span>
+                            </div>
                             <div className="text-2xl font-black mt-1">{it.qty} <span className="text-xs font-normal text-slate-500">pairs</span></div>
                           </div>
                           <div className="flex-shrink-0">
@@ -449,41 +504,90 @@ function PicklistDrawer({ id, onClose, onChanged }) {
               )}
             </div>
 
-            {/* Print-only body — sorted by location for walking order */}
+            {/* Print-only body — grouped by style+color as a size matrix
+                with product images. Same layout as the Production Card so
+                warehouse staff can quickly recognise the item at a glance. */}
             <div className="hidden print:block px-6 py-4">
-              <table className="w-full text-sm border-collapse">
-                <thead>
-                  <tr className="border-b-2 border-slate-900">
-                    <th className="text-left py-2 pr-2 w-8">#</th>
-                    <th className="text-left py-2 pr-2">Location</th>
-                    <th className="text-left py-2 pr-2">Style / Color / Size</th>
-                    <th className="text-right py-2 pr-2 w-16">Qty</th>
-                    <th className="text-center py-2 w-16">✓</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedItems.map((it, i) => (
-                    <tr key={i} className="border-b border-slate-300">
-                      <td className="py-3 pr-2 text-slate-500">{i + 1}</td>
-                      <td className="py-3 pr-2">
-                        <div className="flex items-center gap-2">
-                          <QRCodeSVG value={it.location_code} size={40} />
-                          <span className="font-mono font-black text-lg">{it.location_code}</span>
+              {matrix.rows && matrix.rows.length > 0 ? (
+                <div className="space-y-4">
+                  {matrix.rows.map((g, gi) => (
+                    <div key={gi} className="border-2 border-slate-900 break-inside-avoid">
+                      <div className="flex items-stretch">
+                        {/* Product image */}
+                        <div className="w-28 flex-shrink-0 border-r-2 border-slate-900 bg-slate-50 flex items-center justify-center">
+                          <SafeImage
+                            image={{
+                              url: g.image_url,
+                              display_url: g.image_display_url,
+                              thumbnail_url: g.image_thumbnail_url,
+                            }}
+                            alt={g.style_code}
+                            aspectRatio="1/1"
+                            className="w-full"
+                          />
                         </div>
-                        <div className="text-[10px] text-slate-500 ml-12">Rack {it.rack} · Row {it.row} · Col {it.column}</div>
-                      </td>
-                      <td className="py-3 pr-2 font-mono">
-                        <div className="font-bold">{it.style_code}</div>
-                        <div className="text-xs">{it.color} · Size {it.size}</div>
-                      </td>
-                      <td className="py-3 pr-2 text-right font-black text-lg">{it.qty}</td>
-                      <td className="py-3 text-center">
-                        <div className="border-2 border-slate-900 w-6 h-6 mx-auto" />
-                      </td>
-                    </tr>
+                        {/* Header details + matrix */}
+                        <div className="flex-1 min-w-0">
+                          <div className="px-3 py-2 border-b-2 border-slate-900 bg-slate-100 flex items-baseline justify-between">
+                            <div>
+                              <div className="font-mono font-black text-base">{g.style_code}</div>
+                              <div className="text-[10px] text-slate-600">{g.style_name}</div>
+                              <div className="text-[11px] font-bold uppercase tracking-wider">Color: <span className="font-mono">{g.color}</span></div>
+                            </div>
+                            <div className="text-right">
+                              <div className="text-[9px] uppercase text-slate-500">Group Total</div>
+                              <div className="text-2xl font-black font-mono">{g.total}</div>
+                              <div className="text-[9px] uppercase text-slate-500">pairs</div>
+                            </div>
+                          </div>
+                          {/* Size × Qty matrix (Production-Card style) */}
+                          <table className="w-full text-xs border-collapse">
+                            <thead>
+                              <tr className="bg-slate-50">
+                                <th className="border border-slate-400 px-2 py-1 text-left w-16">Size</th>
+                                {matrix.allSizes.map((sz) => (
+                                  <th key={sz} className="border border-slate-400 px-1 py-1 text-center font-mono">{sz}</th>
+                                ))}
+                                <th className="border border-slate-400 px-2 py-1 text-center bg-slate-200 w-16">Total</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr>
+                                <td className="border border-slate-400 px-2 py-1 font-bold uppercase text-[10px]">Qty</td>
+                                {matrix.allSizes.map((sz) => {
+                                  const cell = g.sizes[sz];
+                                  return (
+                                    <td key={sz} className={`border border-slate-400 px-1 py-1 text-center font-mono font-bold ${cell ? "bg-white text-slate-900" : "bg-slate-50 text-slate-300"}`}>
+                                      {cell ? cell.qty : "·"}
+                                    </td>
+                                  );
+                                })}
+                                <td className="border border-slate-400 px-2 py-1 text-center bg-slate-100 font-black font-mono text-base">{g.total}</td>
+                              </tr>
+                              <tr>
+                                <td className="border border-slate-400 px-2 py-1 font-bold uppercase text-[10px]">Location</td>
+                                {matrix.allSizes.map((sz) => {
+                                  const cell = g.sizes[sz];
+                                  return (
+                                    <td key={sz} className={`border border-slate-400 px-1 py-0.5 text-center font-mono ${cell ? "text-[9px] text-slate-700" : "text-slate-300"}`}>
+                                      {cell ? cell.locations.join(", ") : "·"}
+                                    </td>
+                                  );
+                                })}
+                                <td className="border border-slate-400 px-2 py-1 text-center">
+                                  <div className="border-2 border-slate-900 w-6 h-6 mx-auto" title="Picked" />
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
                   ))}
-                </tbody>
-              </table>
+                </div>
+              ) : (
+                <div className="text-center py-8 text-slate-500 text-sm">No items to pick.</div>
+              )}
               <div className="mt-6 text-xs text-slate-500 border-t border-slate-300 pt-2 flex justify-between">
                 <span>Picker signature: __________________________</span>
                 <span>Time: __________</span>

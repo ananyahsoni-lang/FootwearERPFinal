@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
-import { http, formatApiError } from "../lib/api";
+import { http, formatApiError, friendlyAxiosError } from "../lib/api";
 import {
   PageHeader, Card, BtnPrimary, BtnSecondary,
   Input, Select, Badge,
@@ -511,6 +511,7 @@ export default function OnlineStylePipeline() {
   const [channel, setChannel]   = useState("");
   const [advanceCard, setAdvanceCard] = useState(null);
   const [editCard, setEditCard]       = useState(null);
+  const [showAddPicker, setShowAddPicker] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -612,8 +613,8 @@ export default function OnlineStylePipeline() {
         ) : rows.length === 0 ? (
           <Card className="p-10 text-center">
             <Layers className="w-10 h-10 text-slate-300 mx-auto mb-3" />
-            <div className="text-slate-500 font-semibold mb-1">No styles yet.</div>
-            <div className="text-xs text-slate-400">Create a style in Styles master; it appears here as Draft automatically.</div>
+            <div className="text-slate-500 font-semibold mb-1">No styles in the online pipeline yet.</div>
+            <div className="text-xs text-slate-400">Only styles you explicitly opt-in appear here. Use &quot;Add Style&quot; above, or the globe icon on a style card in the Styles master.</div>
           </Card>
         ) : (
           <div className="flex gap-3 min-w-max pb-4">
@@ -682,5 +683,103 @@ export default function OnlineStylePipeline() {
         />
       )}
     </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   Add-Style-to-Pipeline picker drawer.
+   Lists styles that are NOT yet in the pipeline; user picks one,
+   backend adds a "draft" lifecycle doc via POST /styles/{id}/pipeline.
+   ──────────────────────────────────────────────────────────── */
+function AddStyleToPipelineDrawer({ onClose, onAdded }) {
+  const [styles, setStyles]   = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch]   = useState("");
+  const [adding, setAdding]   = useState(null);
+  const [err, setErr]         = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr("");
+    try {
+      const qs = search ? `?search=${encodeURIComponent(search)}` : "";
+      const r = await http.get(`/styles/not-in-pipeline${qs}`);
+      setStyles(r.data || []);
+    } catch (e) { setErr(friendlyAxiosError(e)); }
+    finally { setLoading(false); }
+  }, [search]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const addOne = async (sid, code) => {
+    setAdding(sid); setErr("");
+    try {
+      await http.post(`/styles/${sid}/pipeline`);
+      onAdded && onAdded();
+    } catch (e) {
+      setErr(friendlyAxiosError(e));
+    } finally { setAdding(null); }
+  };
+
+  return (
+    <Drawer onClose={onClose} title="Add Style to Online Pipeline" width="max-w-2xl">
+      <div className="space-y-4">
+        <div className="text-xs text-slate-500">
+          Only styles NOT yet in the pipeline are shown. Adding creates a Draft lifecycle entry — you can then advance it through Sample → Live in the pipeline board.
+        </div>
+
+        <Input
+          label="Search"
+          placeholder="Style code or name…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && load()}
+          testId="add-pipeline-search"
+        />
+
+        {err && (
+          <div className="p-2 bg-red-50 border-2 border-red-300 text-red-800 text-xs">{err}</div>
+        )}
+
+        {loading ? (
+          <div className="text-center py-10 text-slate-400 text-sm">Loading…</div>
+        ) : styles.length === 0 ? (
+          <div className="text-center py-10 text-slate-400 text-sm">
+            {search ? "No matching styles outside the pipeline." : "Every style is already in the pipeline."}
+          </div>
+        ) : (
+          <div className="border-2 border-slate-200 divide-y divide-slate-200 max-h-[60vh] overflow-y-auto">
+            {styles.map((s) => (
+              <div
+                key={s.id}
+                className="flex items-center gap-3 p-3 hover:bg-slate-50"
+                data-testid={`add-pipeline-row-${s.code}`}
+              >
+                <SafeImage
+                  image={{
+                    url: s.image_url,
+                    display_url: s.image_display_url,
+                    thumbnail_url: s.image_thumbnail_url,
+                  }}
+                  alt={s.name}
+                  aspectRatio="1/1"
+                  className="w-14 h-14 flex-shrink-0"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="font-mono font-bold text-sm">{s.code}</div>
+                  <div className="text-xs text-slate-500 truncate">{s.name || "—"}</div>
+                </div>
+                <BtnPrimary
+                  onClick={() => addOne(s.id, s.code)}
+                  disabled={adding === s.id}
+                  data-testid={`add-pipeline-btn-${s.code}`}
+                >
+                  {adding === s.id ? "Adding…" : "Add"}
+                </BtnPrimary>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Drawer>
   );
 }

@@ -500,6 +500,7 @@ class StyleIn(BaseModel):
 
 class POLineItem(BaseModel):
     style_code: str
+    external_sku: Optional[str] = ""     # Client's/marketplace's original code from the PO
     description: Optional[str] = ""
     color: Optional[str] = ""
     size: Optional[str] = ""
@@ -3343,10 +3344,17 @@ async def list_styles(request: Request, status: Optional[str] = None, search: Op
             {"description": search_regex}
         ]
     docs = await db.styles.find(query).sort("created_at", -1).to_list(1000)
+    # Bulk-fetch pipeline membership so the FE can show "In Online Pipeline" badges
+    # and gate the "Send to Online Pipeline" action without an N+1.
+    pipeline_ids = {
+        d["style_id"]
+        for d in await db.style_lifecycle.find({}, {"style_id": 1}).to_list(20000)
+    }
     out = []
     for d in docs:
         d = stringify(d)
         d["costing"] = compute_style_costing(d)
+        d["in_online_pipeline"] = d["id"] in pipeline_ids
         out.append(d)
     return out
 
@@ -11793,6 +11801,23 @@ async def get_picklist(request: Request, pid: str):
         doc = None
     if not doc:
         raise HTTPException(404, "Picklist not found")
+    # Enrich items with style image + client-facing details for print/UX.
+    style_ids = list({ObjectId(i["style_id"]) for i in doc.get("items", []) if i.get("style_id")})
+    style_map: dict = {}
+    if style_ids:
+        async for s in db.styles.find({"_id": {"$in": style_ids}}):
+            style_map[str(s["_id"])] = {
+                "image_url":              s.get("image_url", ""),
+                "image_display_url":      s.get("image_display_url", ""),
+                "image_thumbnail_url":    s.get("image_thumbnail_url", ""),
+                "style_name":             s.get("name", ""),
+            }
+    for it in doc.get("items", []):
+        info = style_map.get(str(it.get("style_id")), {})
+        it["image_url"]           = info.get("image_url", "")
+        it["image_display_url"]   = info.get("image_display_url", "")
+        it["image_thumbnail_url"] = info.get("image_thumbnail_url", "")
+        it["style_name"]          = info.get("style_name", "")
     return stringify(doc)
 
 
@@ -12083,12 +12108,35 @@ async def pending_product_list(request: Request):
         comp_stock_by_style[sid] = {"components_available": ok, "shortages": shortages}
 
     out = []
+    # Preload style images / names for pending jobs so the frontend can render
+    # the picklist-style print card without extra network calls.
+    style_lookup: dict = {}
+    if style_ids:
+        style_object_ids = []
+        for sid in style_ids:
+            try:
+                style_object_ids.append(ObjectId(sid))
+            except Exception:
+                continue
+        if style_object_ids:
+            async for s in db.styles.find({"_id": {"$in": style_object_ids}}):
+                style_lookup[str(s["_id"])] = {
+                    "image_url":              s.get("image_url", ""),
+                    "image_display_url":      s.get("image_display_url", ""),
+                    "image_thumbnail_url":    s.get("image_thumbnail_url", ""),
+                    "style_name":             s.get("name", ""),
+                }
     for j in jobs:
         jd = stringify(j)
         sid = jd.get("style_id")
         info = comp_stock_by_style.get(sid, {"components_available": False, "shortages": []})
         jd["components_available"] = bool(info.get("components_available"))
         jd["component_shortages"]  = info.get("shortages", [])
+        s_meta = style_lookup.get(sid, {})
+        jd["image_url"]           = s_meta.get("image_url", "")
+        jd["image_display_url"]   = s_meta.get("image_display_url", "")
+        jd["image_thumbnail_url"] = s_meta.get("image_thumbnail_url", "")
+        jd["style_name"]          = s_meta.get("style_name", "")
         out.append(jd)
     # Sort: components available first, then by created_at
     out.sort(key=lambda x: (not x.get("components_available"), x.get("created_at", "")))

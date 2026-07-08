@@ -21,6 +21,7 @@ import {
   Upload,
   Download,
   ArrowLeftRight,
+  Globe2,
 } from "lucide-react";
 
 const ONLINE_CHANNELS = ["myntra", "flipkart", "nykaa", "website"];
@@ -447,6 +448,38 @@ export default function Styles() {
     });
   };
 
+  const togglePipeline = (s) => {
+    if (s.in_online_pipeline) {
+      setConfirm({
+        title: "Remove from Online Pipeline",
+        message: `Remove "${s.code}" from the Online Style Pipeline? Its lifecycle stage and any planned components/colors/sizes will be discarded.`,
+        onConfirm: async () => {
+          try {
+            await http.delete(`/styles/${s.id}/pipeline`);
+          } catch (e) {
+            alert(e.response?.data?.detail || e.message);
+          }
+          setConfirm(null);
+          load();
+        },
+      });
+    } else {
+      setConfirm({
+        title: "Send to Online Pipeline",
+        message: `Add "${s.code}" to the Online Style Pipeline as Draft? You can then advance it through Sample → Photoshoot → Catalog → Price → Launch → Live.`,
+        onConfirm: async () => {
+          try {
+            await http.post(`/styles/${s.id}/pipeline`);
+          } catch (e) {
+            alert(e.response?.data?.detail || e.message);
+          }
+          setConfirm(null);
+          load();
+        },
+      });
+    }
+  };
+
   const onImageChange = (imgObj) => {
     setForm((f) => ({
       ...f,
@@ -641,11 +674,16 @@ export default function Styles() {
                     <div className="font-mono text-xs font-bold text-slate-500">
                       {s.code}
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 flex-wrap justify-end">
                       <Badge color={s.status === "active" ? "green" : "gray"}>
                         {s.status === "active" ? "Active" : "Inactive"}
                       </Badge>
                       <Badge color="orange">{s.category}</Badge>
+                      {s.in_online_pipeline && (
+                        <Badge color="blue" data-testid={`online-badge-${s.code}`}>
+                          <Globe2 className="w-3 h-3 inline mr-0.5" /> Online
+                        </Badge>
+                      )}
                     </div>
                   </div>
                   <h3 className="text-lg font-bold mb-1">{s.name}</h3>
@@ -677,6 +715,18 @@ export default function Styles() {
                     >
                       <Pencil className="w-3 h-3 inline -mt-0.5 mr-1" /> Edit
                     </BtnSecondary>
+                    <button
+                      onClick={() => togglePipeline(s)}
+                      title={s.in_online_pipeline ? "Remove from Online Pipeline" : "Send to Online Pipeline"}
+                      data-testid={`pipeline-toggle-${s.code}`}
+                      className={`px-3 py-2 border-2 text-xs font-bold uppercase tracking-wider transition-colors ${
+                        s.in_online_pipeline
+                          ? "border-blue-500 text-blue-700 bg-blue-50 hover:bg-blue-100"
+                          : "border-slate-300 hover:border-blue-500 hover:text-blue-600"
+                      }`}
+                    >
+                      <Globe2 className="w-3.5 h-3.5 inline" />
+                    </button>
                     <button
                       onClick={() => remove(s.id)}
                       className="px-3 py-2 border-2 border-slate-300 hover:border-red-500 hover:text-red-600 text-xs"
