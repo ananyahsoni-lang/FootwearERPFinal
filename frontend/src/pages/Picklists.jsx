@@ -1,9 +1,11 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { http, friendlyAxiosError } from "../lib/api";
+import { useAuth } from "../lib/auth";
 import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
 import { SafeImage } from "../components/ImageUploader";
+import CameraScanner from "../components/CameraScanner";
 import { QRCodeSVG } from "qrcode.react";
-import { RefreshCw, ClipboardList, X, Printer, ScanLine, CheckCircle2, Trash2, Zap, ZapOff } from "lucide-react";
+import { RefreshCw, ClipboardList, X, Printer, ScanLine, CheckCircle2, Trash2, Zap, ZapOff, Camera } from "lucide-react";
 
 const STATUS_COLORS = {
   pending: "yellow",
@@ -136,23 +138,35 @@ export default function Picklists() {
 }
 
 function PicklistDrawer({ id, onClose, onChanged }) {
+  const { user }            = useAuth();
   const [pl, setPl]         = useState(null);
   const [err, setErr]       = useState("");
   const [scan, setScan]     = useState("");
   const [scanIdx, setScanIdx] = useState(null);
   const [scanMode, setScanMode] = useState(false);   // scanner-gun mode — auto-advance
+  const [cameraOpen, setCameraOpen] = useState(false); // phone-camera scanning modal
   const [flash, setFlash]   = useState("");           // brief success/error flash
   const scanRef = useRef();
   const flashTimeout = useRef();
+  const pickerName = (user && (user.name || user.email)) || "";
 
   async function load() {
     setErr("");
     try {
       const r = await http.get(`/picklists/${id}`);
-      setPl(r.data);
+      let doc = r.data;
+      // Auto-assign the picker to the logged-in user the first time this
+      // drawer is opened — picker should always match who's actually picking.
+      if (pickerName && !doc.picker) {
+        try {
+          await http.patch(`/picklists/${id}`, { picker: pickerName });
+        } catch { /* best-effort */ }
+        doc = { ...doc, picker: pickerName };
+      }
+      setPl(doc);
       // In scan mode, auto-position on first unpicked item
-      if (scanMode && r.data.status !== "completed" && r.data.status !== "cancelled") {
-        const nextIdx = r.data.items.findIndex(it => !it.picked);
+      if (scanMode && doc.status !== "completed" && doc.status !== "cancelled") {
+        const nextIdx = doc.items.findIndex(it => !it.picked);
         if (nextIdx >= 0) {
           setScanIdx(nextIdx);
           setTimeout(() => scanRef.current && scanRef.current.focus(), 50);
@@ -235,19 +249,45 @@ function PicklistDrawer({ id, onClose, onChanged }) {
     }
   }
 
+  // Called by <CameraScanner>. Returns `true` when the pick was fully consumed
+  // so the scanner can stop; otherwise keeps scanning for the next item.
+  async function onCameraScan(text) {
+    const cleaned = cleanScan(text);
+    if (!cleaned || !pl) return false;
+    // Find the first unpicked item whose location matches the scanned code
+    const idx = pl.items.findIndex(
+      (it) => !it.picked && cleanScan(it.location_code) === cleaned
+    );
+    if (idx < 0) {
+      briefFlash(`No pending item at ${cleaned}`, true);
+      return false;         // keep scanning
+    }
+    try {
+      const resp = await http.post(`/picklists/${id}/pick-item`, {
+        item_index: idx,
+        scanned_location: cleaned,
+      });
+      briefFlash(`Picked ${resp.data.items[idx].location_code}`);
+      setPl(resp.data);
+      onChanged && onChanged();
+      const remaining = resp.data.items.some((it) => !it.picked);
+      if (!remaining) {
+        setCameraOpen(false);
+        return true;         // stop scanning — nothing left
+      }
+      return false;          // more items — keep scanning
+    } catch (e) {
+      briefFlash(friendlyAxiosError(e), true);
+      return false;          // recoverable, keep camera live
+    }
+  }
+
   async function del() {
     if (!window.confirm("Cancel this picklist and release reservations?")) return;
     try {
       await http.delete(`/picklists/${id}`);
       onChanged && onChanged();
       onClose();
-    } catch (e) { setErr(friendlyAxiosError(e)); }
-  }
-
-  async function assignPicker(name) {
-    try {
-      await http.patch(`/picklists/${id}`, { picker: name });
-      await load();
     } catch (e) { setErr(friendlyAxiosError(e)); }
   }
 
@@ -339,15 +379,28 @@ function PicklistDrawer({ id, onClose, onChanged }) {
                 <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Picklist</div>
                 <div className="font-black text-2xl font-mono">{pl.picklist_no}</div>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-wrap">
                 {pl.status !== "completed" && pl.status !== "cancelled" && (
-                  <BtnSecondary
-                    onClick={toggleScanMode}
-                    className={scanMode ? "bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700" : ""}
-                    data-testid="btn-scan-mode"
-                  >
-                    {scanMode ? <><Zap className="w-3.5 h-3.5 inline mr-1" />Scan Mode</> : <><ZapOff className="w-3.5 h-3.5 inline mr-1" />Scan Mode</>}
-                  </BtnSecondary>
+                  <>
+                    <BtnPrimary
+                      onClick={() => {
+                        const nextIdx = pl.items.findIndex((it) => !it.picked);
+                        if (nextIdx >= 0) setScanIdx(nextIdx);
+                        setCameraOpen(true);
+                      }}
+                      data-testid="btn-camera-scan"
+                      title="Use your phone camera to scan the rack code"
+                    >
+                      <Camera className="w-3.5 h-3.5 inline mr-1" />Scan with Camera
+                    </BtnPrimary>
+                    <BtnSecondary
+                      onClick={toggleScanMode}
+                      className={scanMode ? "bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700" : ""}
+                      data-testid="btn-scan-mode"
+                    >
+                      {scanMode ? <><Zap className="w-3.5 h-3.5 inline mr-1" />Scan-Gun Mode</> : <><ZapOff className="w-3.5 h-3.5 inline mr-1" />Scan-Gun Mode</>}
+                    </BtnSecondary>
+                  </>
                 )}
                 <BtnSecondary onClick={printSheet}><Printer className="w-3.5 h-3.5 inline mr-1" />Print</BtnSecondary>
                 {pl.status !== "completed" && (
@@ -382,15 +435,14 @@ function PicklistDrawer({ id, onClose, onChanged }) {
                 <div><span className="text-slate-500 text-xs uppercase tracking-wider">Channel</span><div><Badge color={CHANNEL_COLORS[pl.channel] || "slate"}>{pl.channel}</Badge></div></div>
                 <div><span className="text-slate-500 text-xs uppercase tracking-wider">Status</span><div><Badge color={STATUS_COLORS[pl.status] || "slate"}>{pl.status.replace("_", " ")}</Badge></div></div>
                 <div><span className="text-slate-500 text-xs uppercase tracking-wider">Picker</span>
-                  <div className="flex gap-2">
-                    <input
-                      className="border border-slate-300 px-2 py-1 text-sm w-40 font-mono"
-                      value={pl.picker || ""}
-                      onChange={e => setPl({ ...pl, picker: e.target.value })}
-                      onBlur={e => e.target.value !== (pl.picker || "") && assignPicker(e.target.value)}
-                      placeholder="Assign picker…"
-                      disabled={pl.status === "completed" || pl.status === "cancelled"}
-                    />
+                  <div className="flex gap-2 items-center">
+                    <div
+                      className="border border-slate-300 bg-slate-100 px-2 py-1 text-sm font-mono min-w-[10rem]"
+                      title="Picker auto-assigned from the signed-in user"
+                      data-testid="picker-name"
+                    >
+                      {pl.picker || pickerName || <span className="text-slate-400">— unassigned —</span>}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -596,6 +648,14 @@ function PicklistDrawer({ id, onClose, onChanged }) {
           </>
         )}
       </div>
+
+      {cameraOpen && pl && (
+        <CameraScanner
+          expected={scanIdx !== null && pl.items[scanIdx] ? pl.items[scanIdx].location_code : ""}
+          onScan={onCameraScan}
+          onClose={() => setCameraOpen(false)}
+        />
+      )}
     </div>
   );
 }

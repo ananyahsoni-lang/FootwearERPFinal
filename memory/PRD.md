@@ -201,3 +201,26 @@ python -m seed_demo --reset     # wipe demo-tagged rows + reseed
 - Feasibility banner appears instantly when 400 pairs of Brown/Sz7 is entered for SSK_00001: `Shortage: DEMO-UPP-TAN (need 420, have 120, short 300) …`
 - Confirming through the 409 → `force_negative_stock=true` path drives stock negative and returns the expected `new_stock` values.
 - B2B Production Kanban's default `/production/jobs` call returns only B2B jobs (verified via curl).
+
+## Iteration 31 (2026-07-08) — Phone-camera barcode scanner + auto-assigned picker
+### Phone camera scanning for picklists
+- New reusable component `/app/frontend/src/components/CameraScanner.jsx` — mobile-first overlay powered by `html5-qrcode` (added via `yarn add html5-qrcode`). Reads QR + 1D barcodes.
+- Prefers the rear/environment-facing camera and offers a "switch camera" toggle if multiple are available.
+- DOM safety: creates an internal `<div>` for the scanner via `document.createElement` and appends it to a React-owned wrapper — React never touches the scanner's mutated DOM, killing the classic `removeChild ... not a child of this node` crash on unmount.
+- Handles `Html5Qrcode.getState()` for graceful stop; ignores per-frame decode failures for a quiet UX.
+- Callback contract: parent's `onScan(text)` returns `true` to stop scanning (single-shot) or falsy to keep scanning (multi-shot). We use multi-shot so a picker can walk from cell to cell without reopening the modal.
+
+### Wired into `Picklists.jsx`
+- New **"Scan with Camera"** primary button in the drawer header. Header banner shows `Expecting: <next-unpicked-location-code>`.
+- On decode → hits the existing `POST /picklists/{id}/pick-item` endpoint (same route as the scan-gun path) with the scanned code. Success advances to the next unpicked item automatically; if none remain, the scanner closes itself.
+- Scan-gun mode preserved for warehouses that still use handhelds — both entry paths funnel to the same backend endpoint.
+
+### Picker auto-assigned to the logged-in user
+- Drawer now consumes `useAuth()` and, if the picklist has no picker yet, fires `PATCH /picklists/{id}` with `picker = user.name || user.email` on load (best-effort).
+- Manual picker input removed — the field is now a locked, read-only display with tooltip "Picker auto-assigned from the signed-in user".
+
+### Verified
+- Console errors gone (`error_overlay_count = 0` in screenshot test).
+- Camera modal opens cleanly and closes cleanly.
+- Picker for PL-DEMO-0001 auto-populated to "Admin" (from the seeded admin user), visible in both the picklists list and inside the drawer.
+- Both scan-gun input and phone camera continue to work independently and share the same POST endpoint.
